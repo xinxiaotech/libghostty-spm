@@ -13,15 +13,19 @@
     import GhosttyKit
 
     public extension AppTerminalView {
-        @objc override func copy(_ sender: Any?) {
+        // These match the NSResponder action-selector names. NSResponder
+        // doesn't declare them as Swift-visible methods so we can't use
+        // `override`; @objc is enough for the Objective-C responder chain
+        // dispatch used by the Edit menu and standard keyboard shortcuts.
+        @objc func copy(_ sender: Any?) {
             _ = surface?.performBindingAction("copy_to_clipboard")
         }
 
-        @objc override func paste(_ sender: Any?) {
+        @objc func paste(_ sender: Any?) {
             _ = surface?.performBindingAction("paste_from_clipboard")
         }
 
-        @objc override func selectAll(_ sender: Any?) {
+        @objc func selectAll(_ sender: Any?) {
             _ = surface?.performBindingAction("select_all")
         }
 
