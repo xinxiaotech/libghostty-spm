@@ -92,5 +92,14 @@
         deinit {
             NotificationCenter.default.removeObserver(self)
         }
+
+        // NSResponder declares selectAll(_:) as open, so it requires
+        // `override` — and Swift extensions can't override, hence this
+        // lives on the class proper. copy(_:) and paste(_:) are action
+        // selectors that aren't declared Swift-visible on NSResponder, so
+        // they stay in the extension.
+        override public func selectAll(_: Any?) {
+            _ = surface?.performBindingAction("select_all")
+        }
     }
 #endif
