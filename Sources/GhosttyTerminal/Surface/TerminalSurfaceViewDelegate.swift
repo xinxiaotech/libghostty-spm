@@ -39,3 +39,8 @@ public protocol TerminalSurfaceBellDelegate: TerminalSurfaceViewDelegate {
 public protocol TerminalSurfaceCloseDelegate: TerminalSurfaceViewDelegate {
     func terminalDidClose(processAlive: Bool)
 }
+
+@MainActor
+public protocol TerminalSurfacePwdDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidChangePwd(_ pwd: String)
+}
