@@ -148,15 +148,18 @@
         func buildKeyInput(action: ghostty_input_action_e) -> ghostty_input_key_s {
             var input = ghostty_input_key_s()
             input.action = action
-            let delivery = TerminalHardwareKeyRouter.routeAppKit(
-                keyCode: keyCode,
-                backend: .exec
-            )
-            if case let .ghostty(ghosttyKey) = delivery {
-                input.keycode = ghosttyKey.rawValue
-            } else {
-                input.keycode = GHOSTTY_KEY_UNIDENTIFIED.rawValue
-            }
+            // libghostty's `ghostty_input_key_s.keycode` is `uint32_t` and is
+            // interpreted as the platform-native virtual keycode (NSEvent
+            // keyCode on macOS). The core translates it through its own
+            // per-platform table to resolve cursor keys, function keys, etc.
+            //
+            // The previous implementation stored `ghostty_input_key_e.rawValue`
+            // here, which libghostty cannot interpret as a macOS keyCode — so
+            // key binding lookups for arrow keys, backspace, and friends
+            // returned false and no bytes were emitted to the PTY. Upstream
+            // `ghostty-org/ghostty`'s macOS app passes the raw `UInt32(keyCode)`
+            // here (see `macos/Sources/Ghostty/NSEvent+Extension.swift`).
+            input.keycode = UInt32(keyCode)
             input.composing = false
             input.text = nil
 
