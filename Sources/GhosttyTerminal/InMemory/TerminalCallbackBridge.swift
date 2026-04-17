@@ -61,6 +61,17 @@ final class TerminalCallbackBridge {
                     .terminalDidChangePwd(pwd)
             }
 
+        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
+            let payload = action.action.desktop_notification
+            let title = payload.title.map { String(cString: $0) } ?? ""
+            let body = payload.body.map { String(cString: $0) } ?? ""
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=desktop_notification title=\(TerminalDebugLog.describe(title)) body=\(TerminalDebugLog.describe(body))"
+            )
+            (delegate as? any TerminalSurfaceDesktopNotificationDelegate)?
+                .terminalDidRequestDesktopNotification(title: title, body: body)
+
         default:
             let category: TerminalDebugCategory =
                 action.tag == GHOSTTY_ACTION_RENDER ? .render : .actions

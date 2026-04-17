@@ -44,3 +44,8 @@ public protocol TerminalSurfaceCloseDelegate: TerminalSurfaceViewDelegate {
 public protocol TerminalSurfacePwdDelegate: TerminalSurfaceViewDelegate {
     func terminalDidChangePwd(_ pwd: String)
 }
+
+@MainActor
+public protocol TerminalSurfaceDesktopNotificationDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidRequestDesktopNotification(title: String, body: String)
+}
