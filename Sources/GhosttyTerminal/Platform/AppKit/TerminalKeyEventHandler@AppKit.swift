@@ -34,6 +34,18 @@
                 return
             }
 
+            // Snapshot whether the IME had an active preedit BEFORE we let
+            // AppKit dispatch this event. CJK IMEs often collapse their
+            // preedit in response to Backspace / Escape by calling
+            // `setMarkedText("")` or `unmarkText()` — so after
+            // `interpretKeyEvents` returns, `hasMarkedText` reads false,
+            // `accumulatedTexts` is empty, and no `doCommand` was recorded.
+            // Without this snapshot we would then fall through and forward
+            // the Backspace to the PTY, deleting a real character that sits
+            // in front of the (now-cancelled) composition. Mirrors upstream
+            // ghostty's `markedTextBefore` guard in `SurfaceView_AppKit`.
+            let hadMarkedText = inputMethodHandler?.hasMarkedText == true
+
             inputMethodHandler?.startCollectingText()
             view.interpretKeyEvents([event])
 
@@ -53,6 +65,7 @@
             }
 
             guard inputMethodHandler?.hasMarkedText != true else { return }
+            if hadMarkedText { return }
             sendKeyEvent(for: event, action: action, to: surface, includeText: true)
         }
 
