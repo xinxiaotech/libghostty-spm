@@ -28,6 +28,16 @@ public final class TerminalSurface {
 
     // MARK: - Input
 
+    /// Ask libghostty which modifiers apply to character translation for the
+    /// given event mods. Honors runtime configs like `macos-option-as-alt`
+    /// that rewrite which physical modifiers influence text generation.
+    /// Returns the input mods unchanged if the surface has already been
+    /// freed, matching the best-effort behavior of the other surface helpers.
+    func translationMods(for mods: ghostty_input_mods_e) -> ghostty_input_mods_e {
+        guard let s = surface else { return mods }
+        return ghostty_surface_key_translation_mods(s, mods)
+    }
+
     @discardableResult
     func sendKeyEvent(_ event: ghostty_input_key_s) -> Bool {
         guard let s = surface else {

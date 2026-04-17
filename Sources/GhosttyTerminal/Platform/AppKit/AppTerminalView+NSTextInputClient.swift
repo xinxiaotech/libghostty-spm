@@ -53,7 +53,11 @@
         }
 
         public func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-            [.underlineStyle, .backgroundColor]
+            // The terminal renders preedit text as plain characters — it
+            // doesn't honor underline or background attributes. Reporting
+            // `[]` tells macOS's IME stack not to bother computing those,
+            // matching upstream ghostty's behavior.
+            []
         }
 
         public func firstRect(
