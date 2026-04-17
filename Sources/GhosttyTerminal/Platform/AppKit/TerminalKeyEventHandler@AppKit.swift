@@ -308,7 +308,25 @@
             if scalar.isASCIIControl {
                 var flags = modifierFlags
                 flags.remove(.control)
-                return self.characters(byApplyingModifiers: flags)
+                let rederived = self.characters(byApplyingModifiers: flags)
+
+                // Structural keys (Tab, Esc, Return, Backspace, …) map to
+                // control bytes with no printable re-derivation — stripping
+                // control still yields a control scalar. Passing that byte
+                // as `ghostty_input_key_s.text` causes libghostty's
+                // kitty-keyboard encoder to emit the raw byte and drop
+                // modifier info (e.g. Shift+Tab was collapsing to "\t").
+                // Leave text nil so the keycode+mods path in the encoder
+                // produces the correct escape sequence.
+                if let rederived,
+                   rederived.count == 1,
+                   let rederivedScalar = rederived.unicodeScalars.first,
+                   rederivedScalar.isASCIIControl
+                {
+                    return nil
+                }
+
+                return rederived
             }
 
             return characters
