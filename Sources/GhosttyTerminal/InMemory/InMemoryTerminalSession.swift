@@ -15,6 +15,18 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
 
+    /// Bytes that arrived before libghostty had a surface bound. Flushed to
+    /// the surface the moment `setSurface` binds one. Without this buffer,
+    /// clients that start streaming output immediately (e.g. a chime-shell-
+    /// server replay buffer delivered at pane-restore time, or a shell
+    /// prompt printed before the pane's NSView enters its window hierarchy)
+    /// would have bytes silently dropped and the grid would stay blank.
+    private var pendingInbound = Data()
+    /// Soft cap so a client that never attaches a surface can't balloon the
+    /// process. 10 MiB is roughly one full default scrollback — plenty for
+    /// an attach replay.
+    private let pendingInboundCap: Int = 10 * 1024 * 1024
+
     public init(
         write: @escaping @Sendable (Data) -> Void,
         resize: @escaping @Sendable (InMemoryTerminalViewport) -> Void
@@ -33,6 +45,20 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             .lifecycle,
             "in-memory session surface=\(surface == nil ? "nil" : "set")"
         )
+        // Flush any bytes that arrived while no surface was bound.
+        if let surface, !pendingInbound.isEmpty {
+            TerminalDebugLog.log(
+                .output,
+                "in-memory flush pending \(pendingInbound.count) bytes on surface attach"
+            )
+            pendingInbound.withUnsafeBytes { buffer in
+                guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+                ghostty_surface_write_buffer(surface, ptr, UInt(pendingInbound.count))
+            }
+            pendingInbound.removeAll(keepingCapacity: false)
+        }
     }
 
     func updateViewport(_ size: TerminalGridMetrics) {
@@ -54,9 +80,17 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let surface else {
+            // Surface not attached yet — buffer until it is. Bounded so a
+            // broken client can't ask us to hold forever; past the cap we
+            // keep only the tail (most recent bytes), which for a terminal
+            // stream is usually what matters for visual state.
+            pendingInbound.append(data)
+            if pendingInbound.count > pendingInboundCap {
+                pendingInbound = pendingInbound.suffix(pendingInboundCap)
+            }
             TerminalDebugLog.log(
                 .output,
-                "terminal <- host dropped \(TerminalDebugLog.describe(data))"
+                "terminal <- host buffered \(data.count) bytes (total pending \(pendingInbound.count))"
             )
             return
         }
