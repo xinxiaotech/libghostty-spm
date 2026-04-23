@@ -38,26 +38,33 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     // MARK: - Surface Lifecycle
 
     func setSurface(_ surface: ghostty_surface_t?) {
+        // We must NOT hold `lock` across `ghostty_surface_write_buffer`: feeding
+        // bytes into libghostty can block until its termio worker drains, and
+        // that worker may re-enter this object on another thread via the
+        // resize callback (`dispatchResize`). Holding the lock across the
+        // write deadlocks main ↔ io thread — visible as a frozen UI on large
+        // replay buffers at pane-restore time.
         lock.lock()
-        defer { lock.unlock() }
         self.surface = surface
+        let pending = pendingInbound
+        pendingInbound = Data()
+        lock.unlock()
+
         TerminalDebugLog.log(
             .lifecycle,
             "in-memory session surface=\(surface == nil ? "nil" : "set")"
         )
-        // Flush any bytes that arrived while no surface was bound.
-        if let surface, !pendingInbound.isEmpty {
+        if let surface, !pending.isEmpty {
             TerminalDebugLog.log(
                 .output,
-                "in-memory flush pending \(pendingInbound.count) bytes on surface attach"
+                "in-memory flush pending \(pending.count) bytes on surface attach"
             )
-            pendingInbound.withUnsafeBytes { buffer in
+            pending.withUnsafeBytes { buffer in
                 guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                     return
                 }
-                ghostty_surface_write_buffer(surface, ptr, UInt(pendingInbound.count))
+                ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
             }
-            pendingInbound.removeAll(keepingCapacity: false)
         }
     }
 
@@ -77,8 +84,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     /// Feed data into the terminal from the host backend.
     public func receive(_ data: Data) {
+        // Snapshot the surface under the lock, then release before feeding
+        // bytes into libghostty — see `setSurface` for the deadlock this
+        // avoids.
         lock.lock()
-        defer { lock.unlock() }
         guard let surface else {
             // Surface not attached yet — buffer until it is. Bounded so a
             // broken client can't ask us to hold forever; past the cap we
@@ -88,12 +97,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             if pendingInbound.count > pendingInboundCap {
                 pendingInbound = pendingInbound.suffix(pendingInboundCap)
             }
+            let total = pendingInbound.count
+            lock.unlock()
             TerminalDebugLog.log(
                 .output,
-                "terminal <- host buffered \(data.count) bytes (total pending \(pendingInbound.count))"
+                "terminal <- host buffered \(data.count) bytes (total pending \(total))"
             )
             return
         }
+        lock.unlock()
 
         TerminalDebugLog.log(
             .output,
@@ -130,8 +142,11 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     /// Signal that the host-managed process has exited.
     public func finish(exitCode: UInt32, runtimeMilliseconds: UInt64) {
+        // Snapshot the surface under the lock, then release before calling
+        // into libghostty — see `setSurface` for the deadlock this avoids.
         lock.lock()
-        defer { lock.unlock() }
+        let surface = self.surface
+        lock.unlock()
         guard let surface else {
             TerminalDebugLog.log(
                 .lifecycle,
