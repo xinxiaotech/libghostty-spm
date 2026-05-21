@@ -69,7 +69,19 @@ final class TerminalSurfaceCoordinator {
     private var displayLink: DisplayLink?
     private let displayLinkTarget = DisplayLinkTarget()
 
-    init() {
+    // MARK: - Render Scheduling
+
+    /// Strategy for dispatching the per-frame draw. Default is the
+    /// dropping+off-main combo, which keeps the main thread free of
+    /// `MTLCommandBuffer.waitUntilCompleted` waits inside libghostty and
+    /// coalesces ticks that arrive while a slow draw is still in flight.
+    /// Injectable for tests.
+    let renderScheduler: TickScheduler
+
+    init(renderScheduler: TickScheduler = DroppingTickScheduler(
+        wrapping: OffMainTickScheduler(label: "dev.chime.terminal.render")
+    )) {
+        self.renderScheduler = renderScheduler
         bridge.onCellSizeChange = { [weak self] width, height in
             self?.handleCellSizeChange(width: width, height: height)
         }
@@ -205,8 +217,32 @@ final class TerminalSurfaceCoordinator {
         TerminalDebugLog.log(.render, "tick")
         controller?.tick()
         surface?.refresh()
-        surface?.draw()
-        onPostRender?()
+
+        // Snapshot the raw surface pointer on main, then drive the Metal
+        // draw off-main so libghostty's internal MTLCommandBuffer wait
+        // never blocks the main thread. `tearDownSurface` drains the
+        // scheduler before calling `surface.free()`, so this pointer is
+        // valid for the lifetime of the closure.
+        guard let rawSurface = surface?.rawValue else {
+            onPostRender?()
+            return
+        }
+        let handle = UncheckedSurfaceHandle(value: rawSurface)
+        renderScheduler.schedule { [weak self] in
+            ghostty_surface_draw(handle.value)
+            Task { @MainActor [weak self] in
+                self?.onPostRender?()
+            }
+            _ = self // keep coordinator alive across draw without retaining strongly elsewhere
+        }
+    }
+
+    /// `ghostty_surface_t` is imported as `UnsafeMutableRawPointer`,
+    /// which is not `Sendable`. The pointer's lifetime is bounded by
+    /// `tearDownSurface().renderScheduler.drain()`, so passing it to
+    /// another thread is safe in practice.
+    private struct UncheckedSurfaceHandle: @unchecked Sendable {
+        let value: ghostty_surface_t
     }
 
     // MARK: - Focus
@@ -234,6 +270,9 @@ final class TerminalSurfaceCoordinator {
         configuration.inMemorySession?.setSurface(nil)
         bridge.rawSurface = nil
         surface?.setFocus(false)
+        // Drain in-flight off-main draws before freeing the surface —
+        // otherwise the render queue may still hold a raw pointer.
+        renderScheduler.drain()
         surface?.free()
         surface = nil
         lastMetrics = nil
