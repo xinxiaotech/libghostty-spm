@@ -215,13 +215,24 @@ final class TerminalSurfaceCoordinator {
 
     func tick() {
         TerminalDebugLog.log(.render, "tick")
+        // controller.tick() pumps libghostty's app-level event loop and
+        // must run on the host's main thread (cross-cutting state across
+        // all surfaces). It's expected to be cheap. If a hang report ever
+        // points here, we'll catch it via the timing log below.
+        let appTickStart = CFAbsoluteTimeGetCurrent()
         controller?.tick()
-        surface?.refresh()
+        let appTickElapsed = CFAbsoluteTimeGetCurrent() - appTickStart
+        if appTickElapsed > 0.050 {
+            TerminalDebugLog.log(.render, "slow controller.tick \(Int(appTickElapsed * 1000))ms")
+        }
 
-        // Snapshot the raw surface pointer on main, then drive the Metal
-        // draw off-main so libghostty's internal MTLCommandBuffer wait
-        // never blocks the main thread. `tearDownSurface` drains the
-        // scheduler before calling `surface.free()`, so this pointer is
+        // Snapshot the raw surface pointer on main, then drive BOTH
+        // ghostty_surface_refresh and ghostty_surface_draw off-main on a
+        // single serial queue. Either call can synchronously wait on a
+        // Metal command buffer inside libghostty (this is what the 0.6.1
+        // hang reports show via _MTLCommandBuffer.waitUntilCompleted in
+        // the Combine→DisplayLink→tick stack). `tearDownSurface` drains
+        // the scheduler before `surface.free()`, so the pointer stays
         // valid for the lifetime of the closure.
         guard let rawSurface = surface?.rawValue else {
             onPostRender?()
@@ -229,6 +240,7 @@ final class TerminalSurfaceCoordinator {
         }
         let handle = UncheckedSurfaceHandle(value: rawSurface)
         renderScheduler.schedule { [weak self] in
+            ghostty_surface_refresh(handle.value)
             ghostty_surface_draw(handle.value)
             Task { @MainActor [weak self] in
                 self?.onPostRender?()
