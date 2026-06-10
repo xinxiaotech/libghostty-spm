@@ -7,13 +7,23 @@
 
 import Foundation
 import GhosttyKit
-import MSDisplayLink
 
 /// Shared terminal state and logic used by both UIKit and AppKit views.
 ///
 /// Platform views own a `TerminalSurfaceCoordinator` instance and set platform-specific
-/// hooks via closures. The core handles surface lifecycle, metrics
-/// synchronization, and frame rendering via display link.
+/// hooks via closures. The core handles surface lifecycle and metrics
+/// synchronization.
+///
+/// Rendering is fully autonomous inside libghostty: each surface has a
+/// renderer thread that redraws on damage (PTY output, resize, focus,
+/// cursor blink) and, for the focused surface on macOS, an internal
+/// vsync display link that re-presents cheaply. The host must NOT drive
+/// per-frame `ghostty_surface_refresh`/`ghostty_surface_draw` calls —
+/// `draw` forces a full Metal frame (`drawFrame(sync: true)` bypasses
+/// the unchanged-frame early-out), so a host-side display link burns
+/// >100% CPU at idle across all attached surfaces. This matches the
+/// upstream Ghostty.app embedding contract, which never calls either
+/// function on a timer.
 @MainActor
 final class TerminalSurfaceCoordinator {
     weak var delegate: (any TerminalSurfaceViewDelegate)? {
@@ -46,60 +56,12 @@ final class TerminalSurfaceCoordinator {
     var onMetricsUpdate: (() -> Void)?
     var onCellSizeDidChange: (() -> Void)?
 
-    /// Called after every display-link render (`tick`).
-    ///
-    /// When `synchronizeMetrics` sends a new pixel size to ghostty via
-    /// `setSize`, the underlying IOSurface is not rebuilt synchronously.
-    /// Until the next full render pass ghostty still uses the **old**
-    /// IOSurface, so it derives an incorrect `contentsScale` for the
-    /// IOSurfaceLayer (e.g. old-pixel-height / new-point-height → 4.62
-    /// instead of the expected 3.0). This causes a visible "jump" on
-    /// every layout change (keyboard show/hide, rotation, color-scheme
-    /// toggle, etc.).
-    ///
-    /// Platform views use this hook to silently enforce the correct
-    /// `contentsScale` and `frame` on sublayers after each render,
-    /// correcting any drift introduced by ghostty within a single frame.
-    var onPostRender: (() -> Void)?
-
     private var lastMetrics: TerminalViewportMetrics?
 
-    // MARK: - Display Link
-
-    private var displayLink: DisplayLink?
-    private let displayLinkTarget = DisplayLinkTarget()
-
-    // MARK: - Render Scheduling
-
-    /// Strategy for dispatching the per-frame draw. Default is the
-    /// dropping+off-main combo, which keeps the main thread free of
-    /// `MTLCommandBuffer.waitUntilCompleted` waits inside libghostty and
-    /// coalesces ticks that arrive while a slow draw is still in flight.
-    /// Injectable for tests.
-    let renderScheduler: TickScheduler
-
-    init(renderScheduler: TickScheduler = DroppingTickScheduler(
-        wrapping: OffMainTickScheduler(label: "dev.chime.terminal.render")
-    )) {
-        self.renderScheduler = renderScheduler
+    init() {
         bridge.onCellSizeChange = { [weak self] width, height in
             self?.handleCellSizeChange(width: width, height: height)
         }
-    }
-
-    func startDisplayLink() {
-        guard displayLink == nil else { return }
-        TerminalDebugLog.log(.lifecycle, "display link start")
-        displayLinkTarget.core = self
-        let link = DisplayLink()
-        link.delegatingObject(displayLinkTarget)
-        displayLink = link
-    }
-
-    func stopDisplayLink() {
-        TerminalDebugLog.log(.lifecycle, "display link stop")
-        displayLink = nil
-        displayLinkTarget.core = nil
     }
 
     // MARK: - Surface Lifecycle
@@ -211,52 +173,6 @@ final class TerminalSurfaceCoordinator {
         synchronizeMetrics()
     }
 
-    // MARK: - Frame Rendering
-
-    func tick() {
-        TerminalDebugLog.log(.render, "tick")
-        // controller.tick() pumps libghostty's app-level event loop and
-        // must run on the host's main thread (cross-cutting state across
-        // all surfaces). It's expected to be cheap. If a hang report ever
-        // points here, we'll catch it via the timing log below.
-        let appTickStart = CFAbsoluteTimeGetCurrent()
-        controller?.tick()
-        let appTickElapsed = CFAbsoluteTimeGetCurrent() - appTickStart
-        if appTickElapsed > 0.050 {
-            TerminalDebugLog.log(.render, "slow controller.tick \(Int(appTickElapsed * 1000))ms")
-        }
-
-        // Snapshot the raw surface pointer on main, then drive BOTH
-        // ghostty_surface_refresh and ghostty_surface_draw off-main on a
-        // single serial queue. Either call can synchronously wait on a
-        // Metal command buffer inside libghostty (this is what the 0.6.1
-        // hang reports show via _MTLCommandBuffer.waitUntilCompleted in
-        // the Combine→DisplayLink→tick stack). `tearDownSurface` drains
-        // the scheduler before `surface.free()`, so the pointer stays
-        // valid for the lifetime of the closure.
-        guard let rawSurface = surface?.rawValue else {
-            onPostRender?()
-            return
-        }
-        let handle = UncheckedSurfaceHandle(value: rawSurface)
-        renderScheduler.schedule { [weak self] in
-            ghostty_surface_refresh(handle.value)
-            ghostty_surface_draw(handle.value)
-            Task { @MainActor [weak self] in
-                self?.onPostRender?()
-            }
-            _ = self // keep coordinator alive across draw without retaining strongly elsewhere
-        }
-    }
-
-    /// `ghostty_surface_t` is imported as `UnsafeMutableRawPointer`,
-    /// which is not `Sendable`. The pointer's lifetime is bounded by
-    /// `tearDownSurface().renderScheduler.drain()`, so passing it to
-    /// another thread is safe in practice.
-    private struct UncheckedSurfaceHandle: @unchecked Sendable {
-        let value: ghostty_surface_t
-    }
-
     // MARK: - Focus
 
     func setFocus(_ focused: Bool) {
@@ -273,18 +189,11 @@ final class TerminalSurfaceCoordinator {
         tearDownSurface(removingBridgeFrom: controller)
     }
 
-    deinit {
-        displayLink = nil
-    }
-
     private func tearDownSurface(removingBridgeFrom controller: TerminalController?) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
         configuration.inMemorySession?.setSurface(nil)
         bridge.rawSurface = nil
         surface?.setFocus(false)
-        // Drain in-flight off-main draws before freeing the surface —
-        // otherwise the render queue may still hold a raw pointer.
-        renderScheduler.drain()
         surface?.free()
         surface = nil
         lastMetrics = nil
@@ -298,20 +207,5 @@ final class TerminalSurfaceCoordinator {
         )
         synchronizeMetrics()
         onCellSizeDidChange?()
-    }
-}
-
-// MARK: - DisplayLinkTarget
-
-/// Bridges the `nonisolated` display link callback back to `@MainActor`
-/// TerminalSurfaceCoordinator. Stored as a separate object because `TerminalSurfaceCoordinator` itself
-/// is `@MainActor` and cannot directly conform to `nonisolated` protocol.
-private final class DisplayLinkTarget: DisplayLinkDelegate, @unchecked Sendable {
-    @MainActor var core: TerminalSurfaceCoordinator?
-
-    nonisolated func synchronization(context _: DisplayLinkCallbackContext) {
-        terminalRunOnMain { [weak self] in
-            self?.core?.tick()
-        }
     }
 }

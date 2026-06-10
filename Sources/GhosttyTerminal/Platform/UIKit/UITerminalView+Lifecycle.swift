@@ -19,7 +19,6 @@
             if window != nil {
                 core.rebuildIfReady()
                 updateColorScheme()
-                core.startDisplayLink()
                 // Defer sublayer frame and metrics sync to the next runloop
                 // so that AutoLayout has resolved final bounds.
                 DispatchQueue.main.async { [weak self] in
@@ -28,7 +27,6 @@
                     core.synchronizeMetrics()
                 }
             } else {
-                core.stopDisplayLink()
                 core.freeSurface()
             }
         }

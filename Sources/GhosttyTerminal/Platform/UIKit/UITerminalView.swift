@@ -107,12 +107,17 @@
             }
             core.onMetricsUpdate = { [weak self] in
                 self?.updateSublayerFrames()
+                // ghostty rebuilds its IOSurface asynchronously after a
+                // resize and can stamp a stale contentsScale on its layer
+                // (the "jump" on keyboard show/hide or rotation). With no
+                // per-frame post-render hook anymore, re-enforce once the
+                // renderer has had a chance to attach the new surface.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.enforceSublayerScale()
+                }
             }
             core.onCellSizeDidChange = { [weak self] in
                 self?.refreshTextInputGeometry(reason: "cell-size-action")
-            }
-            core.onPostRender = { [weak self] in
-                self?.enforceSublayerScale()
             }
 
             setupPlatformInput()

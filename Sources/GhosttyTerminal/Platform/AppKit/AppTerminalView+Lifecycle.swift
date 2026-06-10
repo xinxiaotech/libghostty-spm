@@ -49,10 +49,10 @@
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if window != nil {
+            if let window {
                 core.rebuildIfReady()
                 updateColorScheme()
-                core.startDisplayLink()
+                pushOcclusionState()
 
                 NotificationCenter.default.addObserver(
                     self,
@@ -66,8 +66,13 @@
                     name: NSWindow.didResignKeyNotification,
                     object: window
                 )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowDidChangeOcclusionState),
+                    name: NSWindow.didChangeOcclusionStateNotification,
+                    object: window
+                )
             } else {
-                core.stopDisplayLink()
                 core.freeSurface()
                 NotificationCenter.default.removeObserver(self)
             }
@@ -81,6 +86,18 @@
 
         @objc internal func windowDidResignKey(_: Notification) {
             core.setFocus(false)
+        }
+
+        // Occlusion gates libghostty's internal render machinery: an
+        // occluded surface stops its vsync display link and skips draws
+        // entirely, so minimized/hidden windows cost no render CPU.
+        @objc internal func windowDidChangeOcclusionState(_: Notification) {
+            pushOcclusionState()
+        }
+
+        internal func pushOcclusionState() {
+            guard let window else { return }
+            surface?.setOcclusion(window.occlusionState.contains(.visible))
         }
 
         override func setFrameSize(_ newSize: NSSize) {
@@ -111,14 +128,6 @@
                 width: bounds.width * scale,
                 height: bounds.height * scale
             )
-        }
-
-        internal func enforceMetalLayerScale() {
-            guard let metalLayer else { return }
-            let scale = core.scaleFactor()
-            if metalLayer.contentsScale != scale {
-                metalLayer.contentsScale = scale
-            }
         }
 
         override func viewDidChangeEffectiveAppearance() {

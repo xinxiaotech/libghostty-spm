@@ -84,9 +84,6 @@
             core.onMetricsUpdate = { [weak self] in
                 self?.updateMetalLayerMetrics()
             }
-            core.onPostRender = { [weak self] in
-                self?.enforceMetalLayerScale()
-            }
         }
 
         deinit {
