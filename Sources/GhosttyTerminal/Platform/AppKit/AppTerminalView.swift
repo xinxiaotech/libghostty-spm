@@ -63,8 +63,19 @@
 
             core.isAttached = { [weak self] in self?.window != nil }
             core.scaleFactor = { [weak self] in
-                Double(
-                    self?.window?.backingScaleFactor
+                guard let self else { return 2.0 }
+                // Prefer the view's own backing transform: it describes the
+                // backing store this view actually renders into, which is
+                // what libghostty needs for font DPI. `backingScaleFactor`
+                // is read as a fallback for the detached case, where
+                // `convertToBacking` degenerates to the identity transform
+                // and would report a bogus 1.0.
+                if window != nil {
+                    let backing = convertToBacking(NSSize(width: 1, height: 1)).width
+                    if backing > 0 { return Double(backing) }
+                }
+                return Double(
+                    window?.backingScaleFactor
                         ?? NSScreen.main?.backingScaleFactor ?? 2.0
                 )
             }

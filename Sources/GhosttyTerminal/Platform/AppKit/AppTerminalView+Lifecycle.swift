@@ -72,6 +72,32 @@
                     name: NSWindow.didChangeOcclusionStateNotification,
                     object: window
                 )
+                // `viewDidChangeBackingProperties` alone is not a dependable
+                // signal for a scale change. It doesn't fire at all when the
+                // display configuration changes underneath a stationary
+                // window (resolution switch, monitor plugged/unplugged), and
+                // when it does fire during a drag between screens AppKit may
+                // not have finished adopting the new backing scale yet. These
+                // three notifications cover the cases the override misses;
+                // the handler is cheap and idempotent when nothing moved.
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowDidChangeBackingProperties),
+                    name: NSWindow.didChangeBackingPropertiesNotification,
+                    object: window
+                )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowDidChangeScreen),
+                    name: NSWindow.didChangeScreenNotification,
+                    object: window
+                )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(screenParametersDidChange),
+                    name: NSApplication.didChangeScreenParametersNotification,
+                    object: nil
+                )
             } else {
                 core.freeSurface()
                 NotificationCenter.default.removeObserver(self)
@@ -112,8 +138,47 @@
 
         override func viewDidChangeBackingProperties() {
             super.viewDidChangeBackingProperties()
-            updateMetalLayerMetrics()
+            handleBackingScaleChange()
+        }
+
+        @objc internal func windowDidChangeBackingProperties(_: Notification) {
+            handleBackingScaleChange()
+        }
+
+        @objc internal func windowDidChangeScreen(_: Notification) {
+            handleBackingScaleChange()
+        }
+
+        @objc internal func screenParametersDidChange(_: Notification) {
+            handleBackingScaleChange()
+        }
+
+        /// Re-derives the backing scale and pushes it to libghostty.
+        ///
+        /// Order matters: the surface is resized first so libghostty knows
+        /// its new pixel extent, and the Metal layer's `drawableSize` is
+        /// updated afterwards (via `onMetricsUpdate`, plus the explicit call
+        /// here for the no-surface-yet case). Doing it the other way round
+        /// leaves a window where the drawable has already grown to 2x while
+        /// libghostty is still rendering a 1x frame into it — which reads on
+        /// screen as blurry text shrunk into a corner of the pane.
+        ///
+        /// The deferred second pass exists because AppKit delivers these
+        /// signals mid-transition: the window can still report the *old*
+        /// screen's backing scale at this point, in which case the first
+        /// pass re-applies the stale value. Re-running once the current
+        /// runloop turn drains picks up the settled value, and costs
+        /// nothing when the scale really didn't change.
+        internal func handleBackingScaleChange() {
+            applyBackingScale()
+            Task { @MainActor [weak self] in
+                self?.applyBackingScale()
+            }
+        }
+
+        private func applyBackingScale() {
             core.synchronizeMetrics()
+            updateMetalLayerMetrics()
         }
 
         func fitToSize() {

@@ -57,6 +57,7 @@ final class TerminalSurfaceCoordinator {
     var onCellSizeDidChange: (() -> Void)?
 
     private var lastMetrics: TerminalViewportMetrics?
+    private var lastAppliedScale: Double?
 
     init() {
         bridge.onCellSizeChange = { [weak self] width, height in
@@ -134,6 +135,17 @@ final class TerminalSurfaceCoordinator {
             "sync view=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height)) scale=\(String(format: "%.2f", scale)) pixels=\(pixelWidth)x\(pixelHeight)"
         )
 
+        if scale != lastAppliedScale {
+            TerminalDebugLog.log(
+                .metrics,
+                "content scale changed \(lastAppliedScale.map { String(format: "%.2f", $0) } ?? "none") -> \(String(format: "%.2f", scale))"
+            )
+            lastAppliedScale = scale
+        }
+
+        // Scale first, then size. libghostty derives its font DPI from the
+        // content scale, so applying size against a stale scale sizes the
+        // grid with the wrong cell metrics.
         surface.setContentScale(x: scale, y: scale)
         surface.setSize(width: pixelWidth, height: pixelHeight)
 
@@ -197,6 +209,7 @@ final class TerminalSurfaceCoordinator {
         surface?.free()
         surface = nil
         lastMetrics = nil
+        lastAppliedScale = nil
         controller?.remove(bridge)
     }
 
