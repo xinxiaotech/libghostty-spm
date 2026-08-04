@@ -77,9 +77,13 @@ public struct TerminalInputModifiers: OptionSet, Hashable, Sendable {
             if flags.contains(.capsLock) {
                 mods.insert(.caps)
             }
-            if flags.contains(.numericPad) {
-                mods.insert(.num)
-            }
+            // Intentionally do NOT map `.numericPad` to `.num`. AppKit sets
+            // `.numericPad` on every arrow / function key whose physical
+            // location is on the keypad, regardless of whether num-lock is
+            // engaged (and Mac keyboards have no meaningful num-lock state).
+            // Forwarding it as a kitty-keyboard `num` modifier made bare
+            // arrow keys encode as e.g. `\e[1;129A`, which TUIs interpret
+            // as "arrow with num_lock held" and ignore.
             self = mods
         }
     #endif
