@@ -64,19 +64,5 @@ public struct TerminalInputModifiers: OptionSet, Sendable {
             // as "arrow with num_lock held" and ignore.
             self = mods
         }
-
-        /// Reverse of `init(from: NSEvent.ModifierFlags)`, used when libghostty
-        /// returns translated modifiers (via `ghostty_surface_key_translation_mods`)
-        /// and we need to re-express them as AppKit flags for `NSEvent.keyEvent`.
-        public var nsModifierFlags: NSEvent.ModifierFlags {
-            var flags = NSEvent.ModifierFlags()
-            if contains(.shift) { flags.insert(.shift) }
-            if contains(.ctrl) { flags.insert(.control) }
-            if contains(.alt) { flags.insert(.option) }
-            if contains(.super_) { flags.insert(.command) }
-            if contains(.caps) { flags.insert(.capsLock) }
-            if contains(.num) { flags.insert(.numericPad) }
-            return flags
-        }
     #endif
 }

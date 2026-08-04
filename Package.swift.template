@@ -4,15 +4,18 @@ import PackageDescription
 let package = Package(
     name: "GhosttyKit",
     platforms: [
-        .iOS(.v16),
+        .iOS(.v15),
         .macOS(.v13),
-        .macCatalyst(.v16),
+        .macCatalyst(.v15),
     ],
     products: [
         .library(name: "GhosttyKit", targets: ["GhosttyKit"]),
         .library(name: "GhosttyTerminal", targets: ["GhosttyTerminal"]),
         .library(name: "ShellCraftKit", targets: ["ShellCraftKit"]),
         .library(name: "GhosttyTheme", targets: ["GhosttyTheme"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/Lakr233/MSDisplayLink.git", from: "2.1.0"),
     ],
     targets: [
         .target(
@@ -26,7 +29,7 @@ let package = Package(
         ),
         .target(
             name: "GhosttyTerminal",
-            dependencies: ["GhosttyKit"],
+            dependencies: ["GhosttyKit", "MSDisplayLink"],
             path: "Sources/GhosttyTerminal"
         ),
         .target(

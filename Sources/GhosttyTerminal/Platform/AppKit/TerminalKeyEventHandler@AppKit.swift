@@ -3,6 +3,12 @@
 //  libghostty-spm
 //
 //  Created by Lakr233 on 2026/3/16.
+//  Reference:
+//  - ghostty-org/ghostty
+//  - macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+//  Translation modifiers, interpretKeyEvents dispatch, and text emission are
+//  kept close to Ghostty's native AppKit implementation to reduce long-term
+//  drift from upstream keyboard/IME semantics.
 //
 
 #if canImport(AppKit) && !canImport(UIKit)
@@ -13,10 +19,27 @@
     final class TerminalKeyEventHandler {
         private weak var view: AppTerminalView?
         var inputMethodHandler: TerminalTextInputHandler?
+        private var interpretedCommandSelector: Selector?
 
         init(view: AppTerminalView) {
             self.view = view
             inputMethodHandler = TerminalTextInputHandler(view: view)
+        }
+
+        nonisolated static func shouldUseDirectInput(
+            modifierFlags: NSEvent.ModifierFlags
+        ) -> Bool {
+            modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty
+        }
+
+        nonisolated static func shouldReplayInterpretedCommand(
+            _ selector: Selector
+        ) -> Bool {
+            // AppKit sometimes resolves non-text keys into editing commands
+            // (for example Shift-Tab -> insertBacktab:). In a terminal, those
+            // commands still need to reach Ghostty as the original hardware key.
+            let _ = selector
+            return true
         }
 
         func handleKeyDown(with event: NSEvent) {
@@ -28,46 +51,24 @@
 
             let action: ghostty_input_action_e = event.isARepeat
                 ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
-
-            // Command-modded keys don't run through IME / text translation —
-            // forward them straight through. (performKeyEquivalent, which
-            // upstream ghostty uses for keybind-aware Cmd routing, is not
-            // implemented here yet.)
-            guard !event.modifierFlags.contains(.command) else {
-                sendKeyEvent(
-                    for: event, action: action, to: surface,
-                    includeText: false, composing: false, translationEvent: nil
-                )
-                return
-            }
-
-            // Ask libghostty which modifiers apply for character translation.
-            // This honors configs like `macos-option-as-alt` — without it,
-            // e.g. Option+E would always produce the dead-key "´" instead of
-            // the user's chosen behavior. Upstream SurfaceView_AppKit.swift
-            // does the same via `ghostty_surface_key_translation_mods`.
-            let translationEvent = makeTranslationEvent(for: event, surface: surface)
-
-            // Snapshot preedit state BEFORE `interpretKeyEvents`. CJK IMEs
-            // collapse their preedit in response to Backspace / Escape by
-            // calling `setMarkedText("")` / `unmarkText()`. Without this
-            // snapshot the key would leak to the PTY after the IME cancelled
-            // the composition, deleting a real character sitting in front of
-            // what the user was composing. Mirrors upstream ghostty's
-            // `markedTextBefore` flag in `SurfaceView_AppKit.keyDown`.
-            let markedTextBefore = inputMethodHandler?.hasMarkedText == true
+            let translationEvent = translatedEvent(for: event, on: surface)
 
             inputMethodHandler?.startCollectingText()
+            interpretedCommandSelector = nil
+            let markedTextBefore = inputMethodHandler?.hasMarkedText == true
+            let keyboardIdBefore = markedTextBefore ? nil : KeyboardLayout.id
+            view.lastPerformKeyEvent = nil
             view.interpretKeyEvents([translationEvent])
-
-            if inputMethodHandler?.consumeHandledTextCommand() == true {
+            if !markedTextBefore, keyboardIdBefore != KeyboardLayout.id {
+                _ = inputMethodHandler?.finishCollectingText()
                 return
             }
+            inputMethodHandler?.syncPreedit(clearIfNeeded: markedTextBefore)
 
             if let collected = inputMethodHandler?.finishCollectingText() {
                 var input = event.buildKeyInput(
-                    action: action, composing: false,
-                    translationEvent: translationEvent
+                    action: action,
+                    translationModifiers: translationEvent.modifierFlags
                 )
                 for text in collected {
                     text.withCString { ptr in
@@ -78,70 +79,29 @@
                 return
             }
 
-            // Always call through to libghostty; use the `composing` bit to
-            // tell it whether this keystroke belongs to an active (or
-            // just-cancelled) IME composition. libghostty's key encoder
-            // suppresses text output when composing, so Backspace won't leak
-            // to the PTY — replaces the ad-hoc early-return guard we used
-            // before threading this flag through.
-            let markedTextNow = inputMethodHandler?.hasMarkedText == true
-            let composing = markedTextBefore || markedTextNow
-            sendKeyEvent(
-                for: event, action: action, to: surface,
-                includeText: true, composing: composing,
-                translationEvent: translationEvent
-            )
-        }
-
-        /// Apply `ghostty_surface_key_translation_mods` to the event's
-        /// modifiers and, if anything changed, return a synthesized NSEvent
-        /// carrying the translated mods + re-derived characters. When the
-        /// translation is a no-op we return the original event so object
-        /// identity is preserved — AppKit's input context is sensitive to
-        /// that for certain Korean / dead-key sequences (upstream notes the
-        /// same gotcha).
-        private func makeTranslationEvent(
-            for event: NSEvent,
-            surface: TerminalSurface
-        ) -> NSEvent {
-            let rawGhosttyMods = TerminalInputModifiers(from: event.modifierFlags).ghosttyMods
-            let translatedGhosttyMods = surface.translationMods(for: rawGhosttyMods)
-            let translatedSet = TerminalInputModifiers(rawValue: translatedGhosttyMods.rawValue)
-            let translatedNSFlags = translatedSet.nsModifierFlags
-
-            // Upstream comment: the event carries hidden bits (dead-key
-            // state, etc.) we mustn't replace wholesale. Only toggle the
-            // four user-facing modifiers from the translation result; leave
-            // everything else on `event.modifierFlags` untouched.
-            var translationModifierFlags = event.modifierFlags
-            for flag in [NSEvent.ModifierFlags.shift, .control, .option, .command] {
-                if translatedNSFlags.contains(flag) {
-                    translationModifierFlags.insert(flag)
-                } else {
-                    translationModifierFlags.remove(flag)
+            if let selector = interpretedCommandSelector {
+                interpretedCommandSelector = nil
+                if Self.shouldReplayInterpretedCommand(selector) {
+                    sendKeyEvent(
+                        for: event,
+                        translationEvent: translationEvent,
+                        action: action,
+                        to: surface,
+                        includeText: false,
+                        composing: inputMethodHandler?.hasMarkedText == true || markedTextBefore
+                    )
+                    return
                 }
             }
 
-            if translationModifierFlags == event.modifierFlags {
-                return event
-            }
-
-            return NSEvent.keyEvent(
-                with: event.type,
-                location: event.locationInWindow,
-                modifierFlags: translationModifierFlags,
-                timestamp: event.timestamp,
-                windowNumber: event.windowNumber,
-                context: nil,
-                characters: event.characters(byApplyingModifiers: translationModifierFlags) ?? "",
-                charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? "",
-                isARepeat: event.isARepeat,
-                keyCode: event.keyCode
-            ) ?? event
-        }
-
-        func handleTextCommand(_ selector: Selector) {
-            inputMethodHandler?.handleCommand(selector)
+            sendKeyEvent(
+                for: event,
+                translationEvent: translationEvent,
+                action: action,
+                to: surface,
+                includeText: true,
+                composing: inputMethodHandler?.hasMarkedText == true || markedTextBefore
+            )
         }
 
         func handleKeyUp(with event: NSEvent) {
@@ -149,57 +109,71 @@
             if shouldBypassGhosttyForDirectInput(event) {
                 return
             }
-            var input = event.buildKeyInput(
-                action: GHOSTTY_ACTION_RELEASE, composing: false,
-                translationEvent: nil
-            )
+            var input = event.buildKeyInput(action: GHOSTTY_ACTION_RELEASE)
             input.text = nil
             surface.sendKeyEvent(input)
         }
 
         func handleFlagsChanged(with event: NSEvent) {
-            guard let view, let surface = view.surface else { return }
+            guard let surface = view?.surface else { return }
+            guard inputMethodHandler?.hasMarkedText != true else { return }
 
-            let action: ghostty_input_action_e = isModifierPress(event)
-                ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE
+            let mod: UInt32
+            switch event.keyCode {
+            case 0x39: mod = GHOSTTY_MODS_CAPS.rawValue
+            case 0x38, 0x3C: mod = GHOSTTY_MODS_SHIFT.rawValue
+            case 0x3B, 0x3E: mod = GHOSTTY_MODS_CTRL.rawValue
+            case 0x3A, 0x3D: mod = GHOSTTY_MODS_ALT.rawValue
+            case 0x37, 0x36: mod = GHOSTTY_MODS_SUPER.rawValue
+            default: return
+            }
 
-            var input = event.buildKeyInput(
-                action: action, composing: false,
-                translationEvent: nil
-            )
+            let mods = TerminalInputModifiers(from: event.modifierFlags).ghosttyMods
+
+            var action = GHOSTTY_ACTION_RELEASE
+            if mods.rawValue & mod != 0 {
+                let sidePressed: Bool = switch event.keyCode {
+                case 0x3C:
+                    event.modifierFlags.rawValue
+                        & UInt(NX_DEVICERSHIFTKEYMASK) != 0
+                case 0x3E:
+                    event.modifierFlags.rawValue
+                        & UInt(NX_DEVICERCTLKEYMASK) != 0
+                case 0x3D:
+                    event.modifierFlags.rawValue
+                        & UInt(NX_DEVICERALTKEYMASK) != 0
+                case 0x36:
+                    event.modifierFlags.rawValue
+                        & UInt(NX_DEVICERCMDKEYMASK) != 0
+                default:
+                    true
+                }
+
+                if sidePressed {
+                    action = GHOSTTY_ACTION_PRESS
+                }
+            }
+
+            var input = event.buildKeyInput(action: action)
             input.text = nil
             surface.sendKeyEvent(input)
         }
 
-        private func isModifierPress(_ event: NSEvent) -> Bool {
-            let flags = event.modifierFlags
-            switch event.keyCode {
-            case 56, 60: return flags.contains(.shift)
-            case 58, 61: return flags.contains(.option)
-            case 59, 62: return flags.contains(.control)
-            case 55, 54: return flags.contains(.command)
-            case 57: return flags.contains(.capsLock)
-            default: return false
-            }
-        }
-
         private func sendKeyEvent(
             for event: NSEvent,
+            translationEvent: NSEvent,
             action: ghostty_input_action_e,
             to surface: TerminalSurface,
             includeText: Bool,
-            composing: Bool,
-            translationEvent: NSEvent?
+            composing: Bool = false
         ) {
             var input = event.buildKeyInput(
-                action: action, composing: composing,
-                translationEvent: translationEvent
+                action: action,
+                translationModifiers: translationEvent.modifierFlags
             )
-            // Characters come from the translated event when available so
-            // that `macos-option-as-alt` et al. produce the right bytes.
-            let textSource = translationEvent ?? event
+            input.composing = composing
             guard includeText,
-                  let chars = textSource.filteredCharacters,
+                  let chars = translationEvent.filteredCharacters,
                   !chars.isEmpty
             else {
                 surface.sendKeyEvent(input)
@@ -217,7 +191,7 @@
             // During IME composition, AppKit needs to keep ownership of editing
             // commands so marked text can shrink, cancel, and move correctly.
             guard inputMethodHandler?.hasMarkedText != true else { return false }
-            guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            guard Self.shouldUseDirectInput(modifierFlags: event.modifierFlags) else {
                 return false
             }
             let delivery = TerminalHardwareKeyRouter.routeAppKit(
@@ -233,10 +207,73 @@
 
         private func shouldBypassGhosttyForDirectInput(_ event: NSEvent) -> Bool {
             guard let view else { return false }
+            guard Self.shouldUseDirectInput(modifierFlags: event.modifierFlags) else {
+                return false
+            }
             return TerminalHardwareKeyRouter.routeAppKit(
                 keyCode: event.keyCode,
                 backend: view.configuration.backend
             ).isDirectInput
+        }
+
+        private func translatedEvent(
+            for event: NSEvent,
+            on surface: TerminalSurface
+        ) -> NSEvent {
+            guard let rawSurface = surface.rawValue else {
+                return event
+            }
+
+            let translatedMods = eventModifierFlags(
+                from: ghostty_surface_key_translation_mods(
+                    rawSurface,
+                    TerminalInputModifiers(from: event.modifierFlags).ghosttyMods
+                )
+            )
+
+            var finalModifiers = event.modifierFlags
+            for flag in [
+                NSEvent.ModifierFlags.shift,
+                .control,
+                .option,
+                .command,
+            ] {
+                if translatedMods.contains(flag) {
+                    finalModifiers.insert(flag)
+                } else {
+                    finalModifiers.remove(flag)
+                }
+            }
+
+            guard finalModifiers != event.modifierFlags else {
+                return event
+            }
+
+            return NSEvent.keyEvent(
+                with: event.type,
+                location: event.locationInWindow,
+                modifierFlags: finalModifiers,
+                timestamp: event.timestamp,
+                windowNumber: event.windowNumber,
+                context: nil,
+                characters: event.characters(byApplyingModifiers: finalModifiers) ?? "",
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? "",
+                isARepeat: event.isARepeat,
+                keyCode: event.keyCode
+            ) ?? event
+        }
+
+        private func eventModifierFlags(from mods: ghostty_input_mods_e) -> NSEvent.ModifierFlags {
+            var flags = NSEvent.ModifierFlags()
+            if mods.rawValue & GHOSTTY_MODS_SHIFT.rawValue != 0 { flags.insert(.shift) }
+            if mods.rawValue & GHOSTTY_MODS_CTRL.rawValue != 0 { flags.insert(.control) }
+            if mods.rawValue & GHOSTTY_MODS_ALT.rawValue != 0 { flags.insert(.option) }
+            if mods.rawValue & GHOSTTY_MODS_SUPER.rawValue != 0 { flags.insert(.command) }
+            return flags
+        }
+
+        func recordInterpretedCommand(_ selector: Selector) {
+            interpretedCommandSelector = selector
         }
     }
 
@@ -245,35 +282,21 @@
     extension NSEvent {
         func buildKeyInput(
             action: ghostty_input_action_e,
-            composing: Bool,
-            translationEvent: NSEvent?
+            translationModifiers: NSEvent.ModifierFlags? = nil
         ) -> ghostty_input_key_s {
             var input = ghostty_input_key_s()
             input.action = action
-            // libghostty's `ghostty_input_key_s.keycode` is `uint32_t` and is
-            // interpreted as the platform-native virtual keycode (NSEvent
-            // keyCode on macOS). The core translates it through its own
-            // per-platform table to resolve cursor keys, function keys, etc.
-            //
-            // The previous implementation stored `ghostty_input_key_e.rawValue`
-            // here, which libghostty cannot interpret as a macOS keyCode — so
-            // key binding lookups for arrow keys, backspace, and friends
-            // returned false and no bytes were emitted to the PTY. Upstream
-            // `ghostty-org/ghostty`'s macOS app passes the raw `UInt32(keyCode)`
-            // here (see `macos/Sources/Ghostty/NSEvent+Extension.swift`).
             input.keycode = UInt32(keyCode)
-            input.composing = composing
+            input.composing = false
             input.text = nil
 
-            // `mods` uses the raw event modifiers so keybind matching sees
-            // what the user actually pressed. `consumed_mods` uses the
-            // translated modifiers (minus control/command, which the
-            // binding system needs) so libghostty knows which mods were
-            // already absorbed by text translation. Matches upstream
-            // ghostty's `NSEvent+Extension.ghosttyKeyEvent` split.
             input.mods = TerminalInputModifiers(from: modifierFlags).ghosttyMods
 
-            var consumedFlags = (translationEvent ?? self).modifierFlags
+            // Consumed modifiers: modifiers the key binding system should
+            // treat as already handled by text generation. We pass through
+            // all modifiers except control and command, which should remain
+            // available for keybind matching.
+            var consumedFlags = translationModifiers ?? modifierFlags
             consumedFlags.remove(.control)
             consumedFlags.remove(.command)
             input.consumed_mods = TerminalInputModifiers(from: consumedFlags).ghosttyMods
@@ -289,35 +312,34 @@
         }
 
         var filteredCharacters: String? {
-            guard let characters else { return nil }
-            guard characters.count == 1,
-                  let scalar = characters.unicodeScalars.first
+            guard let filtered = TerminalInputText.filteredFunctionKeyText(characters) else {
+                return nil
+            }
+            guard filtered.count == 1,
+                  let scalar = filtered.unicodeScalars.first
             else {
-                return characters
+                return filtered
             }
 
             // macOS encodes function keys as Private Use Area scalars —
             // these have no printable representation.
-            if TerminalInputText.isPrivateUseFunctionKey(scalar) {
-                return nil
-            }
-
             // When the control modifier produces a raw control character,
             // re-derive printable text without the control modifier so
             // Ghostty can map the physical key correctly.
             if scalar.isASCIIControl {
                 var flags = modifierFlags
                 flags.remove(.control)
-                let rederived = self.characters(byApplyingModifiers: flags)
+                let rederived = TerminalInputText.filteredFunctionKeyText(
+                    characters(byApplyingModifiers: flags)
+                )
 
                 // Structural keys (Tab, Esc, Return, Backspace, …) map to
                 // control bytes with no printable re-derivation — stripping
                 // control still yields a control scalar. Passing that byte
-                // as `ghostty_input_key_s.text` causes libghostty's
-                // kitty-keyboard encoder to emit the raw byte and drop
-                // modifier info (e.g. Shift+Tab was collapsing to "\t").
-                // Leave text nil so the keycode+mods path in the encoder
-                // produces the correct escape sequence.
+                // as `ghostty_input_key_s.text` makes libghostty's
+                // kitty-keyboard encoder emit the raw byte and drop modifier
+                // info (Shift+Tab was collapsing to "\t"). Leave text nil so
+                // the keycode+mods path produces the correct escape sequence.
                 if let rederived,
                    rederived.count == 1,
                    let rederivedScalar = rederived.unicodeScalars.first,
@@ -329,7 +351,7 @@
                 return rederived
             }
 
-            return characters
+            return filtered
         }
     }
 

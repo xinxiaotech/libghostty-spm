@@ -11,17 +11,48 @@ extension TerminalController {
     public func updateConfigSource(_ source: ConfigSource) -> Bool {
         guard source != configSource else { return true }
 
-        let prepared: PreparedConfig
         switch Self.prepareConfig(source: source) {
         case let .success(value):
-            prepared = value
+            applyPreparedConfigToRuntime(value, source: source)
+            return true
 
         case let .failure(issue):
             lastConfigurationIssue = issue.description
             Self.reportConfigurationIssue(issue.description)
             return false
         }
+    }
 
+    func applyResolvedConfig(
+        _ resolved: (source: ConfigSource, contents: String),
+        willChange: (() -> Void)?,
+        applyState: () -> Void = {}
+    ) -> Bool {
+        guard resolved.source != configSource else {
+            // ObservableObject subscribers expect will-change semantics.
+            willChange?()
+            applyState()
+            renderedConfigContents = resolved.contents
+            return true
+        }
+
+        switch Self.prepareConfig(source: resolved.source) {
+        case let .success(prepared):
+            // Notify after validation succeeds, but before committed state
+            // changes become visible through computed TerminalViewState APIs.
+            willChange?()
+            applyState()
+            applyPreparedConfigToRuntime(prepared, source: resolved.source)
+            return true
+
+        case let .failure(issue):
+            lastConfigurationIssue = issue.description
+            Self.reportConfigurationIssue(issue.description)
+            return false
+        }
+    }
+
+    private func applyPreparedConfigToRuntime(_ prepared: PreparedConfig, source: ConfigSource) {
         let previousConfig = config
         let previousManagedConfigURL = managedConfigURL
         let nextConfig = prepared.rawValue
@@ -44,8 +75,6 @@ extension TerminalController {
         if let previousManagedConfigURL, previousManagedConfigURL != managedConfigURL {
             try? FileManager.default.removeItem(at: previousManagedConfigURL)
         }
-
-        return true
     }
 
     func applyInitialConfig(source: ConfigSource) {
@@ -72,12 +101,13 @@ extension TerminalController {
 
         var runtimeConfig = ghostty_runtime_config_s()
         runtimeConfig.userdata = userdata
-        runtimeConfig.supports_selection_clipboard = false
+        runtimeConfig.supports_selection_clipboard = true
         runtimeConfig.wakeup_cb = terminalControllerWakeupCallback
         runtimeConfig.action_cb = terminalControllerActionCallback
         runtimeConfig.close_surface_cb = terminalControllerCloseSurfaceCallback
         runtimeConfig.write_clipboard_cb = terminalControllerWriteClipboardCallback
         runtimeConfig.read_clipboard_cb = terminalControllerReadClipboardCallback
+        runtimeConfig.confirm_read_clipboard_cb = terminalControllerConfirmReadClipboardCallback
 
         app = ghostty_app_new(&runtimeConfig, cfg)
     }

@@ -10,7 +10,7 @@
     import UIKit
 
     @MainActor
-    public final class UITerminalView: UIView {
+    open class UITerminalView: UIView {
         let core = TerminalSurfaceCoordinator()
         var momentumDisplayLink: CADisplayLink?
         var momentumVelocity: CGPoint = .zero
@@ -18,9 +18,15 @@
             static let minFontSize: Float = 4
             static let maxFontSize: Float = 64
         #endif
-        #if targetEnvironment(macCatalyst)
-            var activePointerButton: ghostty_input_mouse_button_e?
+        var activePointerButton: ghostty_input_mouse_button_e?
+        var pointerSelectionStartPoint: CGPoint?
+        var lastPointerSelectionRect: CGRect?
+        var pendingSelectionMenuPoint: CGPoint?
+        #if !targetEnvironment(macCatalyst)
+            var indirectPointerPanOwnsTouchSequence = false
+            var suppressNextIndirectPointerTouchEnd = false
         #endif
+        lazy var selectionContextMenuInteraction = UIContextMenuInteraction(delegate: self)
         var hardwareKeyHandled = false
         let touchScrollMultiplier: CGFloat = 3.0
         #if !targetEnvironment(macCatalyst)
@@ -29,6 +35,7 @@
         #endif
         lazy var inputHandler = TerminalTextInputHandler(view: self)
         weak var _inputDelegate: (any UITextInputDelegate)?
+        var onFocusChange: ((Bool) -> Void)?
 
         #if !targetEnvironment(macCatalyst)
             lazy var terminalInputAccessory = TerminalInputAccessoryView(terminalView: self)
@@ -39,23 +46,30 @@
         #endif
 
         #if !targetEnvironment(macCatalyst)
-            public var inputAccessoryStyle: TerminalInputAccessoryStyle {
+            open var inputAccessoryStyle: TerminalInputAccessoryStyle {
                 get { terminalInputAccessory.style }
                 set { terminalInputAccessory.style = newValue }
             }
+
+            open var inputAccessoryItems: [TerminalInputAccessoryItem] = TerminalInputAccessoryItem.defaultItems {
+                didSet {
+                    terminalInputAccessory.rebuildContent()
+                    reloadInputViews()
+                }
+            }
         #endif
 
-        public weak var delegate: (any TerminalSurfaceViewDelegate)? {
+        open weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }
             set { core.delegate = newValue }
         }
 
-        public var controller: TerminalController? {
+        open var controller: TerminalController? {
             get { core.controller }
             set { core.controller = newValue }
         }
 
-        public var configuration: TerminalSurfaceOptions {
+        open var configuration: TerminalSurfaceOptions {
             get { core.configuration }
             set { core.configuration = newValue }
         }
@@ -64,11 +78,11 @@
             core.surface
         }
 
-        public var hasText: Bool {
+        open var hasText: Bool {
             true
         }
 
-        override public var canBecomeFirstResponder: Bool {
+        override open var canBecomeFirstResponder: Bool {
             true
         }
 
@@ -78,7 +92,7 @@
         }
 
         @available(*, unavailable)
-        required init?(coder _: NSCoder) {
+        public required init?(coder _: NSCoder) {
             fatalError("init(coder:) has not been implemented")
         }
 
@@ -107,23 +121,127 @@
             }
             core.onMetricsUpdate = { [weak self] in
                 self?.updateSublayerFrames()
-                // ghostty rebuilds its IOSurface asynchronously after a
-                // resize and can stamp a stale contentsScale on its layer
-                // (the "jump" on keyboard show/hide or rotation). With no
-                // per-frame post-render hook anymore, re-enforce once the
-                // renderer has had a chance to attach the new surface.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                    self?.enforceSublayerScale()
-                }
             }
             core.onCellSizeDidChange = { [weak self] in
                 self?.refreshTextInputGeometry(reason: "cell-size-action")
             }
+            core.onPostRender = { [weak self] in
+                self?.enforceSublayerScale()
+            }
 
+            setupApplicationLifecycleObservers()
+            syncApplicationActiveState()
             setupPlatformInput()
             #if !targetEnvironment(macCatalyst)
                 setupKeyboardObservers()
             #endif
+        }
+
+        open func selectionMenuPoint(at point: CGPoint) -> CGPoint? {
+            logPointerSelectionDiagnostics(
+                context: "selectionMenuPoint",
+                point: point
+            )
+            if let rect = lastPointerSelectionRect {
+                let pointIsInsidePointerSelection = rect.insetBy(dx: -4, dy: -4).contains(point)
+                guard pointIsInsidePointerSelection else {
+                    TerminalDebugLog.log(
+                        .input,
+                        "selection menu miss point=\(NSCoder.string(for: point)) outside pointer selection"
+                    )
+                    return nil
+                }
+                guard surface?.hasSelection() == true else {
+                    TerminalDebugLog.log(
+                        .input,
+                        "selection menu miss point=\(NSCoder.string(for: point)) inside pointer selection without active selection"
+                    )
+                    return nil
+                }
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu hit point=\(NSCoder.string(for: point)) inside pointer selection"
+                )
+                return point
+            }
+
+            guard surface?.hasSelection() == true else {
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu miss point=\(NSCoder.string(for: point))"
+                )
+                return nil
+            }
+
+            guard surface?.selectionContainsQuicklookWord() == true else {
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu miss point=\(NSCoder.string(for: point)) outside quicklook word"
+                )
+                return nil
+            }
+
+            TerminalDebugLog.log(
+                .input,
+                "selection menu hit point=\(NSCoder.string(for: point))"
+            )
+            return point
+        }
+
+        open func showSelectionCopyMenu(at point: CGPoint) {
+            becomeFirstResponder()
+            let menu = UIMenuController.shared
+            menu.menuItems = nil
+            menu.showMenu(
+                from: self,
+                rect: CGRect(x: point.x, y: point.y, width: 1, height: 1)
+            )
+            menu.update()
+        }
+
+        @discardableResult
+        open func copySelectedTextToPasteboard() -> Bool {
+            #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+                    accessibilityValue = nil
+                }
+            #endif
+            guard let text = surface?.readSelection(), !text.isEmpty else {
+                return false
+            }
+            UIPasteboard.general.string = text
+            #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+                    accessibilityValue = text
+                }
+            #endif
+            TerminalDebugLog.log(
+                .input,
+                "selection copied bytes=\(text.utf8.count) lines=\(TerminalInputText.lineCount(in: text))"
+            )
+            return true
+        }
+
+        open func selectionContextMenuConfiguration(
+            at _: CGPoint
+        ) -> UIContextMenuConfiguration {
+            UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+                UIMenu(children: self?.selectionContextMenuElements() ?? [])
+            }
+        }
+
+        open func selectionContextMenuElements() -> [UIMenuElement] {
+            let copy = UIAction(
+                title: "Copy",
+                image: UIImage(systemName: "doc.on.doc")
+            ) { [weak self] _ in
+                self?.copySelectedTextToPasteboard()
+            }
+            return [copy]
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
 
         #if !targetEnvironment(macCatalyst)

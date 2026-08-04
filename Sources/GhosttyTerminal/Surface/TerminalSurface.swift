@@ -28,16 +28,6 @@ public final class TerminalSurface {
 
     // MARK: - Input
 
-    /// Ask libghostty which modifiers apply to character translation for the
-    /// given event mods. Honors runtime configs like `macos-option-as-alt`
-    /// that rewrite which physical modifiers influence text generation.
-    /// Returns the input mods unchanged if the surface has already been
-    /// freed, matching the best-effort behavior of the other surface helpers.
-    func translationMods(for mods: ghostty_input_mods_e) -> ghostty_input_mods_e {
-        guard let s = surface else { return mods }
-        return ghostty_surface_key_translation_mods(s, mods)
-    }
-
     @discardableResult
     func sendKeyEvent(_ event: ghostty_input_key_s) -> Bool {
         guard let s = surface else {
@@ -52,10 +42,11 @@ public final class TerminalSurface {
         return result
     }
 
-    func sendText(_ text: String) {
+    @discardableResult
+    public func sendText(_ text: String) -> Bool {
         guard let s = surface else {
             TerminalDebugLog.log(.input, "surface text ignored: missing surface")
-            return
+            return false
         }
         TerminalDebugLog.log(
             .input,
@@ -64,6 +55,7 @@ public final class TerminalSurface {
         text.withCString { cStr in
             ghostty_surface_text(s, cStr, UInt(text.utf8.count))
         }
+        return true
     }
 
     @discardableResult
@@ -121,8 +113,12 @@ public final class TerminalSurface {
 
     // MARK: - Actions
 
+    /// Invoke a named Ghostty binding action.
+    ///
+    /// Action names use the same syntax as Ghostty's `keybind` configuration,
+    /// such as `copy_to_clipboard` or `scroll_page_lines:-3`.
     @discardableResult
-    func performBindingAction(_ action: String) -> Bool {
+    public func performBindingAction(_ action: String) -> Bool {
         guard let s = surface else {
             TerminalDebugLog.log(.actions, "binding action ignored: missing surface")
             return false
@@ -135,6 +131,22 @@ public final class TerminalSurface {
             "binding action=\(TerminalDebugLog.describe(action)) result=\(result)"
         )
         return result
+    }
+
+    /// Jump the viewport by a number of shell prompts.
+    ///
+    /// Negative offsets move toward older prompts and positive offsets move
+    /// toward newer prompts. This requires prompt markers from Ghostty shell
+    /// integration, or equivalent OSC 133 markers from a host-managed backend.
+    @discardableResult
+    public func jumpToPrompt(by offset: Int16) -> Bool {
+        performBindingAction("jump_to_prompt:\(offset)")
+    }
+
+    /// Reveal an absolute scrollback row, where zero is the first row.
+    @discardableResult
+    public func scrollToRow(_ row: UInt) -> Bool {
+        performBindingAction("scroll_to_row:\(row)")
     }
 
     // MARK: - Rendering
@@ -204,6 +216,63 @@ public final class TerminalSurface {
         return metrics
     }
 
+    // MARK: - Selection
+
+    struct SelectionResult {
+        let text: String
+        let offsetStart: UInt32
+        let offsetLength: UInt32
+    }
+
+    func hasSelection() -> Bool {
+        guard let s = surface else {
+            TerminalDebugLog.log(.input, "surface selection query ignored: missing surface")
+            return false
+        }
+        let result = ghostty_surface_has_selection(s)
+        TerminalDebugLog.log(.input, "surface hasSelection=\(result)")
+        return result
+    }
+
+    func readSelection() -> String? {
+        readSelectionResult()?.text
+    }
+
+    func readSelectionResult() -> SelectionResult? {
+        guard let s = surface else {
+            TerminalDebugLog.log(.input, "surface readSelection ignored: missing surface")
+            return nil
+        }
+        var out = ghostty_text_s()
+        guard ghostty_surface_read_selection(s, &out) else {
+            TerminalDebugLog.log(.input, "surface readSelection returned false")
+            return nil
+        }
+        defer { ghostty_surface_free_text(s, &out) }
+
+        guard let textPtr = out.text, out.text_len > 0 else {
+            TerminalDebugLog.log(.input, "surface readSelection empty")
+            return SelectionResult(
+                text: "",
+                offsetStart: out.offset_start,
+                offsetLength: out.offset_len
+            )
+        }
+
+        let bytes = UnsafeBufferPointer(start: textPtr, count: Int(out.text_len))
+            .map { UInt8(bitPattern: $0) }
+        let text = String(decoding: bytes, as: UTF8.self)
+        TerminalDebugLog.log(
+            .input,
+            "surface readSelection bytes=\(text.utf8.count) lines=\(TerminalInputText.lineCount(in: text)) offset=\(out.offset_start)+\(out.offset_len)"
+        )
+        return SelectionResult(
+            text: text,
+            offsetStart: out.offset_start,
+            offsetLength: out.offset_len
+        )
+    }
+
     // MARK: - IME
 
     func imePoint() -> (x: Double, y: Double, width: Double, height: Double) {
@@ -226,6 +295,101 @@ public final class TerminalSurface {
     var isMouseCaptured: Bool {
         guard let s = surface else { return false }
         return ghostty_surface_mouse_captured(s)
+    }
+
+    // MARK: - Quicklook Word (Apple-only)
+
+    #if canImport(UIKit) || canImport(AppKit)
+        struct QuicklookWordResult {
+            let word: String
+            let offsetStart: UInt32
+            let offsetLength: UInt32
+            // tl_px_x / tl_px_y are reported in host points (view coordinates),
+            // not surface pixels. Ghostty's embedded API receives mouse_pos in
+            // points and stores the cursor position * contentScale internally,
+            // then divides by contentScale when reporting selection coordinates
+            // back. Callers must convert cell pixel dimensions to points before
+            // dividing.
+            let pointX: Double
+            let pointY: Double
+        }
+
+        func quicklookWord() -> QuicklookWordResult? {
+            guard let s = surface else {
+                TerminalDebugLog.log(.input, "surface quicklookWord ignored: missing surface")
+                return nil
+            }
+            var out = ghostty_text_s()
+            guard ghostty_surface_quicklook_word(s, &out) else {
+                TerminalDebugLog.log(.input, "surface quicklookWord returned false")
+                return nil
+            }
+            defer { ghostty_surface_free_text(s, &out) }
+
+            let word: String
+            if let textPtr = out.text, out.text_len > 0 {
+                let bytes = UnsafeBufferPointer(start: textPtr, count: Int(out.text_len))
+                    .map { UInt8(bitPattern: $0) }
+                word = String(decoding: bytes, as: UTF8.self)
+            } else {
+                word = ""
+            }
+            TerminalDebugLog.log(
+                .input,
+                "surface quicklookWord word=\(TerminalDebugLog.describe(word)) offset=\(out.offset_start)+\(out.offset_len) pointX=\(String(format: "%.2f", out.tl_px_x)) pointY=\(String(format: "%.2f", out.tl_px_y))"
+            )
+            return QuicklookWordResult(
+                word: word,
+                offsetStart: out.offset_start,
+                offsetLength: out.offset_len,
+                pointX: out.tl_px_x,
+                pointY: out.tl_px_y
+            )
+        }
+
+        func selectionContainsQuicklookWord() -> Bool {
+            guard let selected = readSelectionResult(),
+                  let word = quicklookWord(),
+                  !word.word.isEmpty,
+                  word.offsetLength > 0
+            else { return false }
+
+            let selectionStart = UInt64(selected.offsetStart)
+            let selectionEnd = selectionStart + UInt64(selected.offsetLength)
+            let wordStart = UInt64(word.offsetStart)
+            let wordEnd = wordStart + UInt64(word.offsetLength)
+            let contains = wordStart >= selectionStart && wordEnd <= selectionEnd
+            TerminalDebugLog.log(
+                .input,
+                "surface selectionContainsQuicklookWord=\(contains) selection=\(selected.offsetStart)+\(selected.offsetLength) word=\(word.offsetStart)+\(word.offsetLength)"
+            )
+            return contains
+        }
+    #endif
+
+    // MARK: - Process
+
+    /// PID of the pty's foreground process group (`tcgetpgrp(pty)`). When the
+    /// user runs a program in the pty this is that program's pid, so hosts can
+    /// correlate a surface with an external process list. Ghostty returns 0
+    /// when the surface has no process yet — surfaced here as nil.
+    var foregroundPid: pid_t? {
+        guard let s = surface else { return nil }
+        let pid = ghostty_surface_foreground_pid(s)
+        return pid == 0 ? nil : pid_t(pid)
+    }
+
+    /// Name of the pty's controlling tty (e.g. `/dev/ttys004`), or nil when the
+    /// surface has no process yet. Useful as a cross-check for ``foregroundPid``.
+    var ttyName: String? {
+        guard let s = surface else { return nil }
+        let str = ghostty_surface_tty_name(s)
+        defer { ghostty_string_free(str) }
+        guard let ptr = str.ptr, str.len > 0 else { return nil }
+        return String(
+            decoding: UnsafeRawBufferPointer(start: ptr, count: Int(str.len)),
+            as: UTF8.self
+        )
     }
 
     // MARK: - Lifecycle

@@ -2,6 +2,11 @@
 //  TerminalInputText.swift
 //  libghostty-spm
 //
+//  Reference:
+//  - ghostty-org/ghostty
+//  - macos/Sources/Ghostty/NSEvent+Extension.swift
+//  Keep the AppKit text filtering here aligned with Ghostty's native
+//  `ghosttyCharacters` behavior so future upstream syncs stay mechanical.
 
 import Foundation
 
@@ -20,6 +25,14 @@ enum TerminalInputText {
         }
 
         return text
+    }
+
+    static func lineCount(in text: String) -> Int {
+        text.reduce(into: 0) { count, character in
+            if character == "\n" {
+                count += 1
+            }
+        }
     }
 
     static func isPrivateUseFunctionKey(_ scalar: UnicodeScalar) -> Bool {

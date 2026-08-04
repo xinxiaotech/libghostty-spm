@@ -1,9 +1,10 @@
 @testable import GhosttyTerminal
 import Testing
 
+@Suite(.serialized)
 struct TerminalDebugLogTests {
     @Test
-    func loggingIsDisabledByDefault() {
+    func `logging is disabled by default`() {
         withRestoredDebugLogState {
             #expect(!TerminalDebugLog.isEnabled)
             #expect(TerminalDebugLog.categories == .standard)
@@ -12,7 +13,7 @@ struct TerminalDebugLogTests {
     }
 
     @Test
-    func loggingCanBeToggledAndReconfigured() {
+    func `logging can be toggled and reconfigured`() {
         withRestoredDebugLogState {
             TerminalDebugLog.disable()
             #expect(!TerminalDebugLog.isEnabled)

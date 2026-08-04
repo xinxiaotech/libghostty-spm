@@ -9,23 +9,13 @@ import Foundation
 import GhosttyKit
 
 public final class InMemoryTerminalSession: @unchecked Sendable {
-    private let lock = NSLock()
-    private var surface: ghostty_surface_t?
+    private static let slowSurfaceWriteThreshold: TimeInterval = 0.5
+
+    private let resizeLock = NSLock()
+    private let surfaceAccess: InMemoryTerminalSurfaceAccess
     private var lastResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
-
-    /// Bytes that arrived before libghostty had a surface bound. Flushed to
-    /// the surface the moment `setSurface` binds one. Without this buffer,
-    /// clients that start streaming output immediately (e.g. a chime-shell-
-    /// server replay buffer delivered at pane-restore time, or a shell
-    /// prompt printed before the pane's NSView enters its window hierarchy)
-    /// would have bytes silently dropped and the grid would stay blank.
-    private var pendingInbound = Data()
-    /// Soft cap so a client that never attaches a surface can't balloon the
-    /// process. 10 MiB is roughly one full default scrollback — plenty for
-    /// an attach replay.
-    private let pendingInboundCap: Int = 10 * 1024 * 1024
 
     public init(
         write: @escaping @Sendable (Data) -> Void,
@@ -33,39 +23,100 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     ) {
         writeHandler = write
         resizeHandler = resize
+        surfaceAccess = InMemoryTerminalSurfaceAccess(
+            write: Self.writeToSurface,
+            processExit: Self.reportProcessExit
+        )
+    }
+
+    init(
+        write: @escaping @Sendable (Data) -> Void,
+        resize: @escaping @Sendable (InMemoryTerminalViewport) -> Void,
+        surfaceWrite: @escaping InMemoryTerminalSurfaceAccess.Write,
+        processExit: @escaping InMemoryTerminalSurfaceAccess.ProcessExit =
+            InMemoryTerminalSession.reportProcessExit
+    ) {
+        writeHandler = write
+        resizeHandler = resize
+        surfaceAccess = InMemoryTerminalSurfaceAccess(
+            write: surfaceWrite,
+            processExit: processExit
+        )
     }
 
     // MARK: - Surface Lifecycle
 
     func setSurface(_ surface: ghostty_surface_t?) {
-        // We must NOT hold `lock` across `ghostty_surface_write_buffer`: feeding
-        // bytes into libghostty can block until its termio worker drains, and
-        // that worker may re-enter this object on another thread via the
-        // resize callback (`dispatchResize`). Holding the lock across the
-        // write deadlocks main ↔ io thread — visible as a frozen UI on large
-        // replay buffers at pane-restore time.
-        lock.lock()
-        self.surface = surface
-        let pending = pendingInbound
-        pendingInbound = Data()
-        lock.unlock()
-
+        surfaceAccess.setSurface(surface)
         TerminalDebugLog.log(
             .lifecycle,
             "in-memory session surface=\(surface == nil ? "nil" : "set")"
         )
-        if let surface, !pending.isEmpty {
+    }
+
+    func clearSurface(ifMatches expectedSurface: ghostty_surface_t?) {
+        guard surfaceAccess.clearSurface(ifMatches: expectedSurface) else {
             TerminalDebugLog.log(
-                .output,
-                "in-memory flush pending \(pending.count) bytes on surface attach"
+                .lifecycle,
+                "in-memory session clear skipped expected=\(expectedSurface == nil ? "nil" : "set") current=\(surfaceAccess.currentSurface == nil ? "nil" : "set")"
             )
-            pending.withUnsafeBytes { buffer in
-                guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                    return
-                }
-                ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
-            }
+            return
         }
+
+        TerminalDebugLog.log(.lifecycle, "in-memory session surface=nil matched")
+    }
+
+    var currentSurface: ghostty_surface_t? {
+        surfaceAccess.currentSurface
+    }
+
+    // MARK: - Viewport Read
+
+    /// Returns the active viewport as a UTF-8 string, or `nil` if no surface
+    /// is attached. Lines are separated by `\n`. The `ghostty_text_s`
+    /// lifecycle (allocate via `ghostty_surface_read_text`, free via
+    /// `ghostty_surface_free_text`) is fully encapsulated — callers never
+    /// touch the C buffer.
+    ///
+    /// Selection grammar: `(VIEWPORT, TOP_LEFT)` to `(VIEWPORT, BOTTOM_RIGHT)`
+    /// with `rectangle: false` (linear flow). This reads exactly the visible
+    /// rows and ignores scrollback. Empty viewports return an empty string.
+    ///
+    /// Thread-safe: keeps the surface alive for the duration of the read,
+    /// preventing access against a surface mid-replacement.
+    public func readViewportText() -> String? {
+        surfaceAccess.withCurrentSurface { surface in
+            let topLeft = ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                x: 0,
+                y: 0
+            )
+            let bottomRight = ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                x: 0,
+                y: 0
+            )
+            let selection = ghostty_selection_s(
+                top_left: topLeft,
+                bottom_right: bottomRight,
+                rectangle: false
+            )
+
+            var out = ghostty_text_s()
+            guard ghostty_surface_read_text(surface, selection, &out) else {
+                return nil
+            }
+            defer { ghostty_surface_free_text(surface, &out) }
+
+            guard let textPtr = out.text, out.text_len > 0 else {
+                return ""
+            }
+            let bytes = UnsafeBufferPointer(start: textPtr, count: Int(out.text_len))
+                .map { UInt8(bitPattern: $0) }
+            return String(decoding: bytes, as: UTF8.self)
+        } ?? nil
     }
 
     func updateViewport(_ size: TerminalGridMetrics) {
@@ -82,42 +133,23 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     // MARK: - Receiving Data
 
-    /// Feed data into the terminal from the host backend.
+    /// Enqueue data for the terminal from the host backend.
+    ///
+    /// Writes are processed in order on a per-session serial queue so parsing
+    /// cannot block the caller or the main thread.
     public func receive(_ data: Data) {
-        // Snapshot the surface under the lock, then release before feeding
-        // bytes into libghostty — see `setSurface` for the deadlock this
-        // avoids.
-        lock.lock()
-        guard let surface else {
-            // Surface not attached yet — buffer until it is. Bounded so a
-            // broken client can't ask us to hold forever; past the cap we
-            // keep only the tail (most recent bytes), which for a terminal
-            // stream is usually what matters for visual state.
-            pendingInbound.append(data)
-            if pendingInbound.count > pendingInboundCap {
-                pendingInbound = pendingInbound.suffix(pendingInboundCap)
-            }
-            let total = pendingInbound.count
-            lock.unlock()
+        guard surfaceAccess.enqueueWrite(data) else {
             TerminalDebugLog.log(
                 .output,
-                "terminal <- host buffered \(data.count) bytes (total pending \(total))"
+                "terminal <- host dropped \(TerminalDebugLog.describe(data))"
             )
             return
         }
-        lock.unlock()
 
         TerminalDebugLog.log(
             .output,
             "terminal <- host \(TerminalDebugLog.describe(data))"
         )
-
-        data.withUnsafeBytes { buffer in
-            guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return
-            }
-            ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
-        }
     }
 
     /// Feed a UTF-8 string into the terminal from the host backend.
@@ -140,14 +172,12 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     // MARK: - Process Exit
 
-    /// Signal that the host-managed process has exited.
+    /// Enqueue a host-managed process exit after all previously received data.
     public func finish(exitCode: UInt32, runtimeMilliseconds: UInt64) {
-        // Snapshot the surface under the lock, then release before calling
-        // into libghostty — see `setSurface` for the deadlock this avoids.
-        lock.lock()
-        let surface = self.surface
-        lock.unlock()
-        guard let surface else {
+        guard surfaceAccess.enqueueProcessExit(
+            exitCode: exitCode,
+            runtimeMilliseconds: runtimeMilliseconds
+        ) else {
             TerminalDebugLog.log(
                 .lifecycle,
                 "process exit ignored: missing surface exitCode=\(exitCode) runtimeMs=\(runtimeMilliseconds)"
@@ -159,7 +189,6 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             .lifecycle,
             "process exit exitCode=\(exitCode) runtimeMs=\(runtimeMilliseconds)"
         )
-        ghostty_surface_process_exit(surface, exitCode, runtimeMilliseconds)
     }
 
     // MARK: - C Callbacks
@@ -195,10 +224,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     }
 
     private func dispatchResize(_ resize: InMemoryTerminalViewport) {
-        lock.lock()
+        resizeLock.lock()
         let mergedResize = mergedResize(resize)
         guard mergedResize != lastResize else {
-            lock.unlock()
+            resizeLock.unlock()
             TerminalDebugLog.log(
                 .metrics,
                 "resize unchanged cols=\(mergedResize.columns) rows=\(mergedResize.rows) pixels=\(mergedResize.widthPixels)x\(mergedResize.heightPixels) cell=\(mergedResize.cellWidthPixels)x\(mergedResize.cellHeightPixels)"
@@ -206,7 +235,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             return
         }
         lastResize = mergedResize
-        lock.unlock()
+        resizeLock.unlock()
 
         TerminalDebugLog.log(
             .metrics,
@@ -226,5 +255,37 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             cellWidthPixels: resize.cellWidthPixels == 0 ? lastResize.cellWidthPixels : resize.cellWidthPixels,
             cellHeightPixels: resize.cellHeightPixels == 0 ? lastResize.cellHeightPixels : resize.cellHeightPixels
         )
+    }
+
+    func waitForPendingOutput() {
+        surfaceAccess.waitForPendingOutput()
+    }
+
+    private static func writeToSurface(_ surface: ghostty_surface_t, _ data: Data) {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer {
+            let duration = ProcessInfo.processInfo.systemUptime - start
+            if duration >= slowSurfaceWriteThreshold {
+                TerminalDebugLog.log(
+                    .output,
+                    "surface write slow bytes=\(data.count) duration=\(String(format: "%.3f", duration))s"
+                )
+            }
+        }
+
+        data.withUnsafeBytes { buffer in
+            guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+            ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
+        }
+    }
+
+    private static func reportProcessExit(
+        _ surface: ghostty_surface_t,
+        _ exitCode: UInt32,
+        _ runtimeMilliseconds: UInt64
+    ) {
+        ghostty_surface_process_exit(surface, exitCode, runtimeMilliseconds)
     }
 }

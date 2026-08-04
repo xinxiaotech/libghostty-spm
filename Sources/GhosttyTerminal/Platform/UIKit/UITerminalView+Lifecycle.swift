@@ -8,8 +8,42 @@
 #if canImport(UIKit)
     import UIKit
 
-    public extension UITerminalView {
-        override func didMoveToWindow() {
+    extension UITerminalView {
+        func setupApplicationLifecycleObservers() {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(applicationDidEnterBackground),
+                name: UIApplication.didEnterBackgroundNotification,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(applicationDidBecomeActive),
+                name: UIApplication.didBecomeActiveNotification,
+                object: nil
+            )
+        }
+
+        func syncApplicationActiveState() {
+            core.setApplicationActive(
+                UIApplication.shared.applicationState == .active
+            )
+        }
+
+        @objc func applicationDidEnterBackground(_: Notification) {
+            TerminalDebugLog.log(.lifecycle, "application did enter background")
+            stopMomentumScrolling(sendTerminalEndEvent: false)
+            core.setApplicationActive(false)
+        }
+
+        @objc func applicationDidBecomeActive(_: Notification) {
+            TerminalDebugLog.log(.lifecycle, "application did become active")
+            updateDisplayScale()
+            updateColorScheme()
+            core.setApplicationActive(true)
+        }
+
+        override open func didMoveToWindow() {
             super.didMoveToWindow()
             TerminalDebugLog.log(
                 .lifecycle,
@@ -19,29 +53,31 @@
             if window != nil {
                 core.rebuildIfReady()
                 updateColorScheme()
+                core.startDisplayLink()
                 // Defer sublayer frame and metrics sync to the next runloop
                 // so that AutoLayout has resolved final bounds.
                 DispatchQueue.main.async { [weak self] in
                     guard let self, window != nil else { return }
                     updateSublayerFrames()
-                    core.synchronizeMetrics()
+                    core.fitToSize()
                 }
             } else {
+                core.stopDisplayLink()
                 core.freeSurface()
             }
         }
 
-        override func layoutSubviews() {
+        override open func layoutSubviews() {
             super.layoutSubviews()
             TerminalDebugLog.log(
                 .metrics,
                 "layoutSubviews bounds=\(NSCoder.string(for: bounds))"
             )
             updateSublayerFrames()
-            core.synchronizeMetrics()
+            core.fitToSize()
         }
 
-        internal func resolvedDisplayScale() -> CGFloat {
+        func resolvedDisplayScale() -> CGFloat {
             if let screen = window?.screen {
                 return screen.nativeScale
             }
@@ -51,7 +87,7 @@
             return UIScreen.main.nativeScale
         }
 
-        internal func updateDisplayScale() {
+        func updateDisplayScale() {
             let scale = resolvedDisplayScale()
             TerminalDebugLog.log(
                 .metrics,
@@ -62,7 +98,7 @@
             updateSublayerFrames()
         }
 
-        internal func updateSublayerFrames() {
+        func updateSublayerFrames() {
             let scale = resolvedDisplayScale()
             contentScaleFactor = scale
             layer.contentsScale = scale
@@ -73,7 +109,7 @@
             }
         }
 
-        internal func enforceSublayerScale() {
+        func enforceSublayerScale() {
             let scale = resolvedDisplayScale()
             guard let sublayers = layer.sublayers else { return }
             for sublayer in sublayers {
@@ -86,11 +122,11 @@
             }
         }
 
-        func fitToSize() {
+        public func fitToSize() {
             core.fitToSize()
         }
 
-        override func traitCollectionDidChange(
+        override open func traitCollectionDidChange(
             _ previousTraitCollection: UITraitCollection?
         ) {
             super.traitCollectionDidChange(previousTraitCollection)
@@ -102,25 +138,34 @@
             }
         }
 
-        internal func updateColorScheme() {
+        func updateColorScheme() {
             let style = traitCollection.userInterfaceStyle
             let scheme: TerminalColorScheme = style == .dark ? .dark : .light
             TerminalDebugLog.log(.lifecycle, "updateColorScheme scheme=\(scheme)")
             surface?.setColorScheme(scheme.ghosttyValue)
-            controller?.setColorScheme(scheme)
+            if let controller,
+               let viewState = delegate as? TerminalViewState,
+               viewState.controller === controller
+            {
+                viewState.adopt(terminalColorScheme: scheme)
+            } else {
+                controller?.setColorScheme(scheme)
+            }
         }
 
         @discardableResult
-        override func becomeFirstResponder() -> Bool {
+        override open func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
             core.setFocus(true)
+            onFocusChange?(true)
             return result
         }
 
         @discardableResult
-        override func resignFirstResponder() -> Bool {
+        override open func resignFirstResponder() -> Bool {
             let result = super.resignFirstResponder()
             core.setFocus(false)
+            onFocusChange?(false)
             return result
         }
     }

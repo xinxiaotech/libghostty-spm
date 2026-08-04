@@ -7,23 +7,13 @@
 
 import Foundation
 import GhosttyKit
+import MSDisplayLink
 
 /// Shared terminal state and logic used by both UIKit and AppKit views.
 ///
 /// Platform views own a `TerminalSurfaceCoordinator` instance and set platform-specific
-/// hooks via closures. The core handles surface lifecycle and metrics
-/// synchronization.
-///
-/// Rendering is fully autonomous inside libghostty: each surface has a
-/// renderer thread that redraws on damage (PTY output, resize, focus,
-/// cursor blink) and, for the focused surface on macOS, an internal
-/// vsync display link that re-presents cheaply. The host must NOT drive
-/// per-frame `ghostty_surface_refresh`/`ghostty_surface_draw` calls —
-/// `draw` forces a full Metal frame (`drawFrame(sync: true)` bypasses
-/// the unchanged-frame early-out), so a host-side display link burns
-/// >100% CPU at idle across all attached surfaces. This matches the
-/// upstream Ghostty.app embedding contract, which never calls either
-/// function on a timer.
+/// hooks via closures. The core handles surface lifecycle, metrics
+/// synchronization, and frame rendering via scheduled wakeups.
 @MainActor
 final class TerminalSurfaceCoordinator {
     weak var delegate: (any TerminalSurfaceViewDelegate)? {
@@ -56,13 +46,50 @@ final class TerminalSurfaceCoordinator {
     var onMetricsUpdate: (() -> Void)?
     var onCellSizeDidChange: (() -> Void)?
 
+    /// Called after every display-link render (`tick`).
+    ///
+    /// When `synchronizeMetrics` sends a new pixel size to ghostty via
+    /// `setSize`, the underlying IOSurface is not rebuilt synchronously.
+    /// Until the next full render pass ghostty still uses the **old**
+    /// IOSurface, so it derives an incorrect `contentsScale` for the
+    /// IOSurfaceLayer (e.g. old-pixel-height / new-point-height → 4.62
+    /// instead of the expected 3.0). This causes a visible "jump" on
+    /// every layout change (keyboard show/hide, rotation, color-scheme
+    /// toggle, etc.).
+    ///
+    /// Platform views use this hook to silently enforce the correct
+    /// `contentsScale` and `frame` on sublayers after each render,
+    /// correcting any drift introduced by ghostty within a single frame.
+    var onPostRender: (() -> Void)?
+
     private var lastMetrics: TerminalViewportMetrics?
-    private var lastAppliedScale: Double?
+    private var isDisplayVisible = true
+    private var isApplicationActive = true
+    private var isSurfaceFocused = false
+    private var pendingImmediateTick = true
+    private var lastTickTimestamp: TimeInterval = 0
+    private var tickScheduled = false
 
     init() {
         bridge.onCellSizeChange = { [weak self] width, height in
             self?.handleCellSizeChange(width: width, height: height)
         }
+        bridge.onRenderRequest = { [weak self] in
+            self?.requestImmediateTick()
+        }
+    }
+
+    func requestImmediateTick() {
+        pendingImmediateTick = true
+        scheduleTickIfNeeded()
+    }
+
+    func startDisplayLink() {
+        scheduleTickIfNeeded()
+    }
+
+    func stopDisplayLink() {
+        tickScheduled = false
     }
 
     // MARK: - Surface Lifecycle
@@ -75,6 +102,14 @@ final class TerminalSurfaceCoordinator {
         }
         guard isAttached() else {
             TerminalDebugLog.log(.lifecycle, "surface rebuild skipped: view detached")
+            return
+        }
+        guard hasValidViewSize else {
+            let size = viewSize()
+            TerminalDebugLog.log(
+                .lifecycle,
+                "surface rebuild skipped: invalid view size=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height))"
+            )
             return
         }
 
@@ -97,9 +132,20 @@ final class TerminalSurfaceCoordinator {
         }
 
         bridge.rawSurface = rawSurface
-        surface = TerminalSurface(rawSurface)
+        let newSurface = TerminalSurface(rawSurface)
+        surface = newSurface
+        newSurface.setOcclusion(effectiveSurfaceVisible)
+        controller.shouldProcessWakeup = { [weak self] in
+            self?.canRenderFrame == true
+        }
+        controller.onWakeup = { [weak self] in
+            self?.requestImmediateTick()
+        }
         TerminalDebugLog.log(.lifecycle, "surface rebuild succeeded")
+        (delegate as? any TerminalSurfaceLifecycleDelegate)?
+            .terminalDidAttachSurface(newSurface)
         synchronizeMetrics()
+        requestImmediateTick()
     }
 
     // MARK: - Metrics
@@ -135,17 +181,6 @@ final class TerminalSurfaceCoordinator {
             "sync view=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height)) scale=\(String(format: "%.2f", scale)) pixels=\(pixelWidth)x\(pixelHeight)"
         )
 
-        if scale != lastAppliedScale {
-            TerminalDebugLog.log(
-                .metrics,
-                "content scale changed \(lastAppliedScale.map { String(format: "%.2f", $0) } ?? "none") -> \(String(format: "%.2f", scale))"
-            )
-            lastAppliedScale = scale
-        }
-
-        // Scale first, then size. libghostty derives its font DPI from the
-        // content scale, so applying size against a stale scale sizes the
-        // grid with the wrong cell metrics.
         surface.setContentScale(x: scale, y: scale)
         surface.setSize(width: pixelWidth, height: pixelHeight)
 
@@ -182,12 +217,73 @@ final class TerminalSurfaceCoordinator {
     }
 
     func fitToSize() {
-        synchronizeMetrics()
+        if surface == nil {
+            rebuildIfReady()
+        } else {
+            synchronizeMetrics()
+        }
+        if surface != nil {
+            requestImmediateTick()
+        }
+    }
+
+    func setDisplayVisible(_ visible: Bool) {
+        guard isDisplayVisible != visible else {
+            surface?.setOcclusion(effectiveSurfaceVisible)
+            return
+        }
+
+        isDisplayVisible = visible
+        surface?.setOcclusion(effectiveSurfaceVisible)
+
+        if canRenderFrame {
+            requestImmediateTick()
+        } else {
+            stopDisplayLink()
+        }
+    }
+
+    func setApplicationActive(_ active: Bool) {
+        guard isApplicationActive != active else {
+            if active {
+                renderImmediately()
+            } else {
+                stopDisplayLink()
+            }
+            return
+        }
+
+        isApplicationActive = active
+        surface?.setOcclusion(effectiveSurfaceVisible)
+
+        if active {
+            synchronizeMetrics()
+            renderImmediately()
+        } else {
+            stopDisplayLink()
+        }
+    }
+
+    // MARK: - Frame Rendering
+
+    func tick(context: DisplayLinkCallbackContext) {
+        guard shouldRenderFrame(at: context.timestamp) else {
+            return
+        }
+        pendingImmediateTick = false
+        lastTickTimestamp = context.timestamp
+        TerminalDebugLog.log(.render, "tick")
+        controller?.tick()
+        surface?.refresh()
+        surface?.draw()
+        onPostRender?()
     }
 
     // MARK: - Focus
 
     func setFocus(_ focused: Bool) {
+        isSurfaceFocused = focused
+        requestImmediateTick()
         TerminalDebugLog.log(.lifecycle, "focus=\(focused)")
         surface?.setFocus(focused)
         (delegate as? any TerminalSurfaceFocusDelegate)?
@@ -201,16 +297,38 @@ final class TerminalSurfaceCoordinator {
         tearDownSurface(removingBridgeFrom: controller)
     }
 
+    deinit {
+        // `@MainActor` classes have a nonisolated deinit by default, but
+        // `tearDownSurface` calls methods on other main-actor types (surface,
+        // bridge, controller). We rely on deinit running synchronously with
+        // exclusive access; assume main-actor isolation so teardown can run
+        // inline without crossing isolation.
+        MainActor.assumeIsolated {
+            tearDownSurface(removingBridgeFrom: controller)
+        }
+    }
+
     private func tearDownSurface(removingBridgeFrom controller: TerminalController?) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
-        configuration.inMemorySession?.setSurface(nil)
+        tickScheduled = false
+        if let session = configuration.inMemorySession {
+            session.clearSurface(ifMatches: surface?.rawValue)
+        }
+        controller?.onWakeup = nil
+        controller?.shouldProcessWakeup = nil
         bridge.rawSurface = nil
+        let hadSurface = surface != nil
         surface?.setFocus(false)
         surface?.free()
         surface = nil
         lastMetrics = nil
-        lastAppliedScale = nil
+        pendingImmediateTick = true
+        lastTickTimestamp = 0
         controller?.remove(bridge)
+        if hadSurface {
+            (delegate as? any TerminalSurfaceLifecycleDelegate)?
+                .terminalDidDetachSurface()
+        }
     }
 
     private func handleCellSizeChange(width: UInt32, height: UInt32) {
@@ -219,6 +337,73 @@ final class TerminalSurfaceCoordinator {
             "cell size changed width=\(width) height=\(height)"
         )
         synchronizeMetrics()
+        requestImmediateTick()
         onCellSizeDidChange?()
+    }
+
+    private func shouldRenderFrame(at _: TimeInterval) -> Bool {
+        guard canRenderFrame else {
+            return false
+        }
+        return pendingImmediateTick || lastTickTimestamp == 0
+    }
+
+    private func scheduleTickIfNeeded() {
+        guard canRenderFrame else {
+            tickScheduled = false
+            return
+        }
+        guard !tickScheduled else {
+            return
+        }
+        tickScheduled = true
+        TerminalDebugLog.log(.lifecycle, "tick scheduled")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            tickScheduled = false
+            let timestamp = Self.monotonicTimestamp()
+            tick(
+                context: .init(
+                    duration: 0,
+                    timestamp: timestamp,
+                    targetTimestamp: timestamp
+                )
+            )
+        }
+    }
+
+    private static func monotonicTimestamp() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
+    }
+
+    private var effectiveSurfaceVisible: Bool {
+        isDisplayVisible && isApplicationActive
+    }
+
+    private var canRenderFrame: Bool {
+        effectiveSurfaceVisible && isAttached()
+    }
+
+    private var hasValidViewSize: Bool {
+        let size = viewSize()
+        return size.width > 0 && size.height > 0
+    }
+
+    private func renderImmediately() {
+        guard canRenderFrame else {
+            tickScheduled = false
+            return
+        }
+
+        pendingImmediateTick = true
+        tickScheduled = false
+        let timestamp = Self.monotonicTimestamp()
+        tick(
+            context: .init(
+                duration: 0,
+                timestamp: timestamp,
+                targetTimestamp: timestamp
+            )
+        )
     }
 }

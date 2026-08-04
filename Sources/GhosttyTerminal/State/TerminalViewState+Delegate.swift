@@ -5,14 +5,20 @@
 //  Created by Lakr233 on 2026/3/16.
 //
 
+import Foundation
 import GhosttyKit
 
-@available(macOS 14.0, iOS 17.0, macCatalyst 17.0, *)
 extension TerminalViewState:
     TerminalSurfaceTitleDelegate,
     TerminalSurfaceGridResizeDelegate,
     TerminalSurfaceFocusDelegate,
-    TerminalSurfaceCloseDelegate
+    TerminalSurfaceCloseDelegate,
+    TerminalSurfaceBellDelegate,
+    TerminalSurfaceDesktopNotificationDelegate,
+    TerminalSurfacePwdDelegate,
+    TerminalSurfaceScrollbarDelegate,
+    TerminalSurfaceCommandFinishedDelegate,
+    TerminalSurfaceLifecycleDelegate
 {
     public func terminalDidChangeTitle(_ title: String) {
         self.title = title
@@ -28,5 +34,37 @@ extension TerminalViewState:
 
     public func terminalDidClose(processAlive: Bool) {
         onClose?(processAlive)
+    }
+
+    public func terminalDidRingBell() {
+        bellCount += 1
+        lastBellAt = Date()
+    }
+
+    public func terminalDidRequestDesktopNotification(title: String, body: String) {
+        lastDesktopNotificationTitle = title
+        lastDesktopNotificationBody = body
+        lastDesktopNotificationAt = Date()
+    }
+
+    public func terminalDidChangeWorkingDirectory(_ path: String) {
+        workingDirectory = path
+    }
+
+    public func terminalDidUpdateScrollbar(_ scrollbar: TerminalScrollbar) {
+        self.scrollbar = scrollbar
+    }
+
+    public func terminalDidFinishCommand(exitCode: Int?, durationNanos: UInt64) {
+        lastCommandExitCode = exitCode
+        lastCommandDurationNanos = durationNanos
+    }
+
+    public func terminalDidAttachSurface(_ surface: TerminalSurface) {
+        self.surface = surface
+    }
+
+    public func terminalDidDetachSurface() {
+        surface = nil
     }
 }

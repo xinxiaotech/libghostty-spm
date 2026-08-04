@@ -10,24 +10,33 @@
     import GhosttyKit
 
     @MainActor
-    public final class AppTerminalView: NSView {
+    open class AppTerminalView: NSView {
         let core = TerminalSurfaceCoordinator()
         var metalLayer: CAMetalLayer?
         var inputHandler: TerminalKeyEventHandler?
+        var lastPerformKeyEvent: TimeInterval?
+        var pointerSelectionStartPoint: CGPoint?
+        var lastPointerSelectionRect: CGRect?
+        var pendingSelectionMenuPoint: CGPoint?
+        var onFocusChange: ((Bool) -> Void)?
 
-        public weak var delegate: (any TerminalSurfaceViewDelegate)? {
+        open weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }
             set { core.delegate = newValue }
         }
 
-        public var controller: TerminalController? {
+        open var controller: TerminalController? {
             get { core.controller }
             set { core.controller = newValue }
         }
 
-        public var configuration: TerminalSurfaceOptions {
+        open var configuration: TerminalSurfaceOptions {
             get { core.configuration }
             set { core.configuration = newValue }
+        }
+
+        open func setSurfaceVisible(_ visible: Bool) {
+            core.setDisplayVisible(visible)
         }
 
         var surface: TerminalSurface? {
@@ -40,7 +49,7 @@
         }
 
         @available(*, unavailable)
-        required init?(coder _: NSCoder) {
+        public required init?(coder _: NSCoder) {
             fatalError("init(coder:) has not been implemented")
         }
 
@@ -65,11 +74,9 @@
             core.scaleFactor = { [weak self] in
                 guard let self else { return 2.0 }
                 // Prefer the view's own backing transform: it describes the
-                // backing store this view actually renders into, which is
-                // what libghostty needs for font DPI. `backingScaleFactor`
-                // is read as a fallback for the detached case, where
-                // `convertToBacking` degenerates to the identity transform
-                // and would report a bogus 1.0.
+                // backing store this view actually renders into. Fall back to
+                // the window only when detached, where `convertToBacking`
+                // degenerates to the identity transform and reports 1.0.
                 if window != nil {
                     let backing = convertToBacking(NSSize(width: 1, height: 1)).width
                     if backing > 0 { return Double(backing) }
@@ -95,19 +102,84 @@
             core.onMetricsUpdate = { [weak self] in
                 self?.updateMetalLayerMetrics()
             }
+            core.onPostRender = { [weak self] in
+                self?.enforceMetalLayerScale()
+            }
+        }
+
+        open func selectionMenuPoint(at point: CGPoint) -> CGPoint? {
+            guard surface?.hasSelection() == true else {
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu miss point=\(selectionPointDescription(point))"
+                )
+                return nil
+            }
+
+            if let rect = lastPointerSelectionRect {
+                guard rect.insetBy(dx: -4, dy: -4).contains(point) else {
+                    TerminalDebugLog.log(
+                        .input,
+                        "selection menu miss point=\(selectionPointDescription(point)) outside pointer selection"
+                    )
+                    return nil
+                }
+
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu hit point=\(selectionPointDescription(point)) inside pointer selection"
+                )
+                return point
+            }
+
+            guard surface?.selectionContainsQuicklookWord() == true else {
+                TerminalDebugLog.log(
+                    .input,
+                    "selection menu miss point=\(selectionPointDescription(point)) outside quicklook word"
+                )
+                return nil
+            }
+
+            TerminalDebugLog.log(
+                .input,
+                "selection menu hit point=\(selectionPointDescription(point))"
+            )
+            return point
+        }
+
+        open func selectionContextMenu() -> NSMenu {
+            let menu = NSMenu()
+            let copyItem = NSMenuItem(
+                title: "Copy",
+                action: #selector(copy(_:)),
+                keyEquivalent: ""
+            )
+            copyItem.target = self
+            menu.addItem(copyItem)
+            return menu
+        }
+
+        @discardableResult
+        open func copySelectedTextToPasteboard() -> Bool {
+            guard surface?.hasSelection() == true else {
+                return false
+            }
+            guard surface?.performBindingAction("copy_to_clipboard") == true else {
+                return false
+            }
+            TerminalDebugLog.log(
+                .input,
+                "selection copied to clipboard"
+            )
+            return true
+        }
+
+        private func selectionPointDescription(_ point: CGPoint) -> String {
+            "\(String(format: "%.2f", point.x))x\(String(format: "%.2f", point.y))"
         }
 
         deinit {
             NotificationCenter.default.removeObserver(self)
-        }
-
-        // NSResponder declares selectAll(_:) as open, so it requires
-        // `override` — and Swift extensions can't override, hence this
-        // lives on the class proper. copy(_:) and paste(_:) are action
-        // selectors that aren't declared Swift-visible on NSResponder, so
-        // they stay in the extension.
-        override public func selectAll(_: Any?) {
-            _ = surface?.performBindingAction("select_all")
         }
     }
 #endif

@@ -2,6 +2,15 @@ import Cocoa
 import GhosttyTerminal
 import ShellCraftKit
 
+private final class AppearanceAwareView: NSView {
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
+}
+
 final class ViewController: NSViewController {
     private lazy var terminalView: TerminalView = .init(
         frame: NSRect(x: 0, y: 0, width: 720, height: 480)
@@ -15,7 +24,11 @@ final class ViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView()
+        let container = AppearanceAwareView()
+        container.onAppearanceChange = { [weak self] in
+            self?.applyWindowBackgroundColor()
+        }
+        view = container
     }
 
     override func viewDidLoad() {
@@ -36,11 +49,25 @@ final class ViewController: NSViewController {
 
     private func configureView() {
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        applyWindowBackgroundColor()
+    }
+
+    private func applyWindowBackgroundColor() {
+        // `NSColor.windowBackgroundColor.cgColor` snapshots whichever
+        // appearance is current at the call site, so drawing it naively
+        // caches yesterday's light/dark value on the layer. Resolve it
+        // under the view's effective appearance so the layer follows
+        // system toggles.
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        }
     }
 
     private func configureTerminalView() {
         terminalView.delegate = self
+        terminalView.setAccessibilityElement(true)
+        terminalView.setAccessibilityIdentifier("terminal.surface")
+        terminalView.setAccessibilityLabel("Terminal Surface")
         terminalView.configuration = TerminalSurfaceOptions(
             backend: .inMemory(shellSession.terminalSession)
         )

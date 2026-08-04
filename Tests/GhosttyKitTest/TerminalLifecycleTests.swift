@@ -4,7 +4,7 @@ import Testing
 @MainActor
 struct TerminalLifecycleTests {
     @Test
-    func failedSurfaceCreationDoesNotRetainBridge() {
+    func `failed surface creation does not retain bridge`() {
         let controller = TerminalController()
         let bridge = TerminalCallbackBridge()
 
@@ -18,7 +18,7 @@ struct TerminalLifecycleTests {
     }
 
     @Test
-    func switchingControllersRemovesBridgeFromOldController() {
+    func `switching controllers removes bridge from old controller`() {
         let oldController = TerminalController()
         let newController = TerminalController()
         let coordinator = TerminalSurfaceCoordinator()
@@ -40,7 +40,7 @@ struct TerminalLifecycleTests {
     }
 
     @Test
-    func freeSurfaceRemovesRetainedBridge() {
+    func `free surface removes retained bridge`() {
         let controller = TerminalController()
         let coordinator = TerminalSurfaceCoordinator()
 
@@ -53,5 +53,42 @@ struct TerminalLifecycleTests {
         coordinator.freeSurface()
 
         #expect(controller.retainedBridgeCount == 0)
+    }
+
+    @Test
+    func `suspended wakeup does not schedule render`() {
+        let controller = TerminalController()
+        var wakeups = 0
+
+        controller.shouldProcessWakeup = { false }
+        controller.onWakeup = {
+            wakeups += 1
+        }
+
+        controller.handleWakeup()
+
+        #expect(wakeups == 0)
+    }
+
+    @Test
+    func `application active state controls immediate ticks`() async {
+        let coordinator = TerminalSurfaceCoordinator()
+        var renders = 0
+
+        coordinator.isAttached = { true }
+        coordinator.onPostRender = {
+            renders += 1
+        }
+
+        coordinator.setApplicationActive(false)
+        coordinator.requestImmediateTick()
+        await Task.yield()
+
+        #expect(renders == 0)
+
+        coordinator.setApplicationActive(true)
+        await Task.yield()
+
+        #expect(renders == 1)
     }
 }
