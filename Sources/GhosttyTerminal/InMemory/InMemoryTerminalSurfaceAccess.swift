@@ -20,6 +20,17 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     /// Prevents the caller from freeing a surface while a C operation uses it.
     private var activeOperations = 0
 
+    /// Bytes that arrived before a surface was bound, replayed in order the
+    /// moment one is. Without this, hosts that start streaming immediately —
+    /// a session-restore replay buffer, or a shell prompt printed before the
+    /// view enters its window hierarchy — have those bytes dropped and the
+    /// grid comes up blank.
+    private var pendingInbound = Data()
+    /// Soft cap so a host that never binds a surface can't balloon the
+    /// process. Past the cap we keep the tail, which is the part that
+    /// determines visible terminal state.
+    private let pendingInboundCap = 10 * 1024 * 1024
+
     init(
         write: @escaping Write,
         processExit: @escaping ProcessExit
@@ -34,7 +45,27 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
         self.surface = nil
         waitForActiveOperations()
         self.surface = surface
+
+        // Drain only once a surface is actually bound; clearing to nil must
+        // keep the buffer so the bytes survive until the next bind.
+        let pending: Data
+        if surface != nil {
+            pending = pendingInbound
+            pendingInbound = Data()
+        } else {
+            pending = Data()
+        }
+        let generation = self.generation
         condition.unlock()
+
+        guard !pending.isEmpty else { return }
+        // Enqueued before any write the caller makes after setSurface
+        // returns, so the replay lands ahead of live output.
+        outputQueue.async { [self] in
+            withSurface(generation: generation) { surface in
+                write(surface, pending)
+            }
+        }
     }
 
     @discardableResult
@@ -58,9 +89,21 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
         return surface
     }
 
+    /// Returns false only when the data was neither enqueued nor retained.
     @discardableResult
     func enqueueWrite(_ data: Data) -> Bool {
-        guard let generation = currentGeneration else { return false }
+        condition.lock()
+        guard surface != nil else {
+            pendingInbound.append(data)
+            if pendingInbound.count > pendingInboundCap {
+                pendingInbound = pendingInbound.suffix(pendingInboundCap)
+            }
+            condition.unlock()
+            return true
+        }
+        let generation = self.generation
+        condition.unlock()
+
         outputQueue.async { [self] in
             withSurface(generation: generation) { surface in
                 write(surface, data)

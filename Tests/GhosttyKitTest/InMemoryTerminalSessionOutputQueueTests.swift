@@ -30,6 +30,57 @@ struct InMemoryTerminalSessionOutputQueueTests {
     }
 
     @Test
+    func `bytes received before a surface is bound are replayed on bind`() {
+        let writes = LockedValues<String>()
+        let session = makeSession { _, data in
+            writes.append(String(decoding: data, as: UTF8.self))
+        }
+
+        // No surface yet — these must be retained, not dropped.
+        session.receive(Data("restored".utf8))
+        session.receive(Data(" scrollback".utf8))
+        #expect(writes.values.isEmpty)
+
+        session.setSurface(testSurface(1))
+        session.waitForPendingOutput()
+
+        #expect(writes.values.joined() == "restored scrollback")
+    }
+
+    @Test
+    func `replayed bytes land before output written after bind`() {
+        let writes = LockedValues<String>()
+        let session = makeSession { _, data in
+            writes.append(String(decoding: data, as: UTF8.self))
+        }
+
+        session.receive(Data("early".utf8))
+        session.setSurface(testSurface(1))
+        session.receive(Data("late".utf8))
+        session.waitForPendingOutput()
+
+        #expect(writes.values.joined() == "earlylate")
+    }
+
+    @Test
+    func `clearing the surface keeps buffering for the next bind`() {
+        let writes = LockedValues<String>()
+        let session = makeSession { _, data in
+            writes.append(String(decoding: data, as: UTF8.self))
+        }
+
+        session.setSurface(testSurface(1))
+        session.setSurface(nil)
+        session.receive(Data("while detached".utf8))
+        session.waitForPendingOutput()
+        #expect(writes.values.isEmpty)
+
+        session.setSurface(testSurface(2))
+        session.waitForPendingOutput()
+        #expect(writes.values == ["while detached"])
+    }
+
+    @Test
     func `writes and process exit preserve enqueue order`() {
         let events = LockedValues<String>()
         let session = InMemoryTerminalSession(

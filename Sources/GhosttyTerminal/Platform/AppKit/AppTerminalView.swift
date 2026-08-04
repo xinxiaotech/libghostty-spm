@@ -72,8 +72,17 @@
 
             core.isAttached = { [weak self] in self?.window != nil }
             core.scaleFactor = { [weak self] in
-                Double(
-                    self?.window?.backingScaleFactor
+                guard let self else { return 2.0 }
+                // Prefer the view's own backing transform: it describes the
+                // backing store this view actually renders into. Fall back to
+                // the window only when detached, where `convertToBacking`
+                // degenerates to the identity transform and reports 1.0.
+                if window != nil {
+                    let backing = convertToBacking(NSSize(width: 1, height: 1)).width
+                    if backing > 0 { return Double(backing) }
+                }
+                return Double(
+                    window?.backingScaleFactor
                         ?? NSScreen.main?.backingScaleFactor ?? 2.0
                 )
             }

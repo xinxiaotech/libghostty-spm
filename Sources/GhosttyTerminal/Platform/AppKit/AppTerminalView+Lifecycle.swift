@@ -93,6 +93,12 @@
                     name: NSWindow.didChangeScreenNotification,
                     object: window
                 )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(screenParametersDidChange),
+                    name: NSApplication.didChangeScreenParametersNotification,
+                    object: nil
+                )
             } else {
                 core.stopDisplayLink()
                 core.setFocus(false)
@@ -112,6 +118,19 @@
         }
 
         @objc func windowDidChangeScreen(_: Notification) {
+            scheduleMetricsResync()
+        }
+
+        @objc func screenParametersDidChange(_: Notification) {
+            // Display reconfiguration — a resolution change, or a monitor
+            // plugged or unplugged — can change this view's backing scale
+            // while the window stays on "the same" screen. Neither
+            // didChangeScreen nor viewDidChangeBackingProperties is
+            // guaranteed to fire for that, so this is the only signal.
+            scheduleMetricsResync()
+        }
+
+        private func scheduleMetricsResync() {
             // Defer one runloop tick so AppKit's layout pass and the
             // window's new backingScaleFactor have both settled before we
             // re-derive metrics. Calling synchronously can race with the
@@ -141,6 +160,11 @@
             NotificationCenter.default.removeObserver(
                 self,
                 name: NSWindow.didChangeScreenNotification,
+                object: nil
+            )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSApplication.didChangeScreenParametersNotification,
                 object: nil
             )
         }
