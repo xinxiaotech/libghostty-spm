@@ -19,6 +19,31 @@
             guard window?.firstResponder === self else { return false }
             guard let surface else { return false }
 
+            // The host app's menu gets first refusal on Command chords.
+            //
+            // Ghostty ships keybind defaults describing *its own* window/tab
+            // model — cmd+t (new_tab), cmd+w (close_surface), cmd+n, cmd+1…9,
+            // cmd+shift+[ / ]. An embedding app almost always has menu items
+            // on those same chords, and `keyIsBinding` below would consume the
+            // event and dispatch an action the host never implements: the menu
+            // item simply stops working, with nothing logged.
+            //
+            // AppKit's normal order offers the main menu the event only after
+            // the view tree declines it, so consult the menu here and decline
+            // whenever it takes the event. `performKeyEquivalent` validates
+            // before firing, so a disabled menu item returns false and the
+            // chord still falls through to Ghostty.
+            //
+            // Gated on `.command` deliberately: this method also runs for
+            // plain and control-only keys (see the "\r" and "/" cases below),
+            // and menu equivalents on macOS effectively always carry Command.
+            if respectsHostMenuKeyEquivalents,
+               event.modifierFlags.contains(.command),
+               NSApp.mainMenu?.performKeyEquivalent(with: event) == true
+            {
+                return true
+            }
+
             if keyIsBinding(event, on: surface) {
                 keyDown(with: event)
                 return true

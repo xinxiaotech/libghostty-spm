@@ -15,6 +15,13 @@
         var metalLayer: CAMetalLayer?
         var inputHandler: TerminalKeyEventHandler?
         var lastPerformKeyEvent: TimeInterval?
+
+        /// When true (the default), the application's main menu is offered
+        /// Command key equivalents before Ghostty's built-in keybinds, so a
+        /// host's menu items aren't silently swallowed by Ghostty defaults
+        /// for actions the host doesn't implement. Set false to give
+        /// Ghostty's keybinds priority instead.
+        open var respectsHostMenuKeyEquivalents: Bool = true
         var pointerSelectionStartPoint: CGPoint?
         var lastPointerSelectionRect: CGRect?
         var pendingSelectionMenuPoint: CGPoint?
