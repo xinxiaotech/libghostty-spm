@@ -11,6 +11,19 @@ import GhosttyKit
 public final class InMemoryTerminalSession: @unchecked Sendable {
     private static let slowSurfaceWriteThreshold: TimeInterval = 0.5
 
+    /// How many bytes of host output a session keeps while no surface is
+    /// attached; older bytes are dropped first. Defaults to 1 MiB.
+    ///
+    /// A host that replays a long history into a session before its view
+    /// has a surface — restoring a persisted shell, say — loses everything
+    /// beyond this from the restored scrollback, so such a host raises it.
+    /// Process-wide: set it once at startup, before any session receives
+    /// output.
+    public static var detachedOutputByteLimit: Int {
+        get { InMemoryTerminalSurfaceAccess.pendingWriteByteLimit }
+        set { InMemoryTerminalSurfaceAccess.pendingWriteByteLimit = max(0, newValue) }
+    }
+
     private let resizeLock = NSLock()
     private let surfaceAccess: InMemoryTerminalSurfaceAccess
     private var lastResize: InMemoryTerminalViewport?

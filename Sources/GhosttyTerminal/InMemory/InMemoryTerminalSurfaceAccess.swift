@@ -33,7 +33,10 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     /// The next surface sees exactly this many; meanwhile up to twice as many
     /// are held, so a flood trims once per limit's worth of bytes instead of
     /// moving the whole buffer for every chunk.
-    private static let pendingWriteByteLimit = 1 << 20
+    ///
+    /// Process-wide and meant to be set once at startup, before any session
+    /// receives output (see `InMemoryTerminalSession.detachedOutputByteLimit`).
+    nonisolated(unsafe) static var pendingWriteByteLimit = 1 << 20
     /// Set when detached output went past the limit and the trim to exactly
     /// the limit is still owed to the next surface.
     private var pendingTrimOwed = false
